@@ -13,11 +13,13 @@ from pymongo import MongoClient
 import pymongo
 import ipaddress
 import csv
+import struct
 
 # Try to import PCAP libraries
 try:
     from scapy.all import rdpcap, TCP, Raw, IP
     from scapy.layers.http import HTTPRequest, HTTPResponse
+    from scapy.utils import RawPcapReader
     PCAP_SUPPORT = True
 except ImportError:
     PCAP_SUPPORT = False
@@ -100,54 +102,12 @@ if 'selected_model' not in st.session_state:
 
 # Define available Gemini models with their specifications
 GEMINI_MODELS = {
-    "gemini-2.5-pro": {
-        "name": "Gemini 2.5 Pro",
-        "rate_limit": 2,
-        "context_window": 125000,
-        "daily_limit": 50,
-        "description": "Most capable model for complex reasoning tasks"
-    },
-    "gemini-2.5-flash": {
-        "name": "Gemini 2.5 Flash",
-        "rate_limit": 10,
-        "context_window": 250000,
-        "daily_limit": 250,
-        "description": "Fast and versatile for most tasks"
-    },
-    "gemini-2.5-flash-preview": {
-        "name": "Gemini 2.5 Flash Preview",
-        "rate_limit": 10,
-        "context_window": 250000,
-        "daily_limit": 250,
-        "description": "Preview version with extended capabilities"
-    },
-    "gemini-2.5-flash-lite": {
-        "name": "Gemini 2.5 Flash-Lite",
-        "rate_limit": 15,
-        "context_window": 250000,
-        "daily_limit": 1000,
-        "description": "Lightweight and cost-effective"
-    },
-    "gemini-2.5-flash-lite-preview": {
-        "name": "Gemini 2.5 Flash-Lite Preview",
-        "rate_limit": 15,
-        "context_window": 250000,
-        "daily_limit": 1000,
-        "description": "Preview of lightweight model"
-    },
     "gemini-2.0-flash": {
         "name": "Gemini 2.0 Flash",
         "rate_limit": 15,
         "context_window": 1000000,
         "daily_limit": 200,
-        "description": "Previous generation fast model"
-    },
-    "gemini-2.0-flash-lite": {
-        "name": "Gemini 2.0 Flash-Lite",
-        "rate_limit": 30,
-        "context_window": 1000000,
-        "daily_limit": 200,
-        "description": "Previous generation lightweight"
+        "description": "Fast and reliable model"
     },
     "gemini-1.5-flash": {
         "name": "Gemini 1.5 Flash",
@@ -295,7 +255,7 @@ def is_ip_in_range(ip, ip_range):
         return False
 
 def get_ip_info(ip):
-    """Get basic IP information (can be extended with GeoIP)"""
+    """Get basic IP information"""
     try:
         ip_obj = ipaddress.ip_address(ip)
         return {
@@ -308,7 +268,7 @@ def get_ip_info(ip):
     except:
         return {'ip': ip, 'version': 'unknown'}
 
-# Attack Detection Functions using MongoDB patterns
+# Attack Detection Functions
 def detect_attack_with_patterns(url, attack_id, patterns_data):
     """Generic attack detection using MongoDB patterns"""
     indicators = []
@@ -420,7 +380,6 @@ Important: Return ONLY the JSON object, no additional text."""
     
     except json.JSONDecodeError as e:
         st.error(f"Gemini API Response Parsing Error: {str(e)}")
-        st.info(f"Raw response: {response.text[:200]}...")
         return None
     except Exception as e:
         st.error(f"Gemini API Error: {str(e)}")
@@ -453,112 +412,90 @@ def determine_severity(attack_types):
     
     return "LOW"
 
-# Enhanced PCAP Parsing Functions
-def parse_pcap_with_scapy_enhanced(pcap_file):
-    """Parse PCAP file using Scapy with full HTTP session extraction"""
-    sessions = []
+# Enhanced PCAP Parsing Functions - FIXED VERSION
+def parse_pcap_simple_scapy(pcap_file):
+    """Simple PCAP parsing using Scapy - handles various file formats"""
+    urls = []
     try:
-        packets = rdpcap(pcap_file)
+        # Save uploaded file temporarily
+        temp_path = f"/tmp/{pcap_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(pcap_file.getvalue())
         
-        # Group packets by TCP stream
-        streams = {}
+        # Use RawPcapReader for better format handling
+        packets = rdpcap(temp_path)
+        
         for packet in packets:
-            if packet.haslayer(IP) and packet.haslayer(TCP):
-                # Create stream identifier
-                if packet[IP].src < packet[IP].dst:
-                    stream_id = f"{packet[IP].src}:{packet[TCP].sport}-{packet[IP].dst}:{packet[TCP].dport}"
-                else:
-                    stream_id = f"{packet[IP].dst}:{packet[TCP].dport}-{packet[IP].src}:{packet[TCP].sport}"
+            try:
+                # Check for IP and TCP layers
+                if packet.haslayer(IP) and packet.haslayer(TCP):
+                    # Look for HTTP traffic on common ports
+                    if packet[TCP].dport in [80, 443, 8080, 8000] or packet[TCP].sport in [80, 443, 8080, 8000]:
+                        if packet.haslayer(Raw):
+                            payload = packet[Raw].load
+                            try:
+                                payload_str = payload.decode('utf-8', errors='ignore')
+                                
+                                # Look for HTTP requests
+                                if payload_str.startswith(('GET', 'POST', 'PUT', 'DELETE', 'HEAD')):
+                                    lines = payload_str.split('\r\n')
+                                    if lines:
+                                        request_line = lines[0]
+                                        parts = request_line.split()
+                                        if len(parts) >= 2:
+                                            method = parts[0]
+                                            path = parts[1]
+                                            
+                                            # Extract host from headers
+                                            host = ""
+                                            for line in lines[1:]:
+                                                if line.lower().startswith('host:'):
+                                                    host = line.split(':', 1)[1].strip()
+                                                    break
+                                            
+                                            if host:
+                                                # Determine protocol
+                                                protocol = "https" if packet[TCP].dport == 443 or packet[TCP].sport == 443 else "http"
+                                                url = f"{protocol}://{host}{path}"
+                                                
+                                                url_info = {
+                                                    'url': url,
+                                                    'method': method,
+                                                    'src_ip': packet[IP].src,
+                                                    'dst_ip': packet[IP].dst,
+                                                    'src_port': packet[TCP].sport,
+                                                    'dst_port': packet[TCP].dport,
+                                                    'timestamp': datetime.fromtimestamp(float(packet.time)),
+                                                    'raw_payload': payload_str[:1000]  # Store first 1000 chars
+                                                }
+                                                urls.append(url_info)
+                            except Exception as e:
+                                continue
+            except Exception as e:
+                continue
                 
-                if stream_id not in streams:
-                    streams[stream_id] = {
-                        'src_ip': packet[IP].src,
-                        'dst_ip': packet[IP].dst,
-                        'src_port': packet[TCP].sport,
-                        'dst_port': packet[TCP].dport,
-                        'requests': [],
-                        'responses': []
-                    }
-                
-                # Check for HTTP request
-                if packet.haslayer(HTTPRequest):
-                    http_layer = packet[HTTPRequest]
-                    host = http_layer.Host.decode() if http_layer.Host else ""
-                    path = http_layer.Path.decode() if http_layer.Path else ""
-                    method = http_layer.Method.decode() if http_layer.Method else "GET"
-                    
-                    if host and path:
-                        url = f"http://{host}{path}"
-                        full_request = f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n"
-                        
-                        # Add headers
-                        for field in http_layer.fields:
-                            if field != 'Method' and field != 'Path' and field != 'Http-Version':
-                                value = http_layer.fields[field]
-                                if isinstance(value, bytes):
-                                    value = value.decode()
-                                full_request += f"{field}: {value}\r\n"
-                        
-                        streams[stream_id]['requests'].append({
-                            'url': url,
-                            'method': method,
-                            'full_request': full_request,
-                            'timestamp': datetime.fromtimestamp(packet.time),
-                            'src_ip': packet[IP].src,
-                            'dst_ip': packet[IP].dst
-                        })
-                
-                # Check for HTTP response
-                elif packet.haslayer(HTTPResponse):
-                    if packet.haslayer(Raw):
-                        try:
-                            response_content = packet[Raw].load.decode('utf-8', errors='ignore')
-                            status_match = re.search(r'HTTP/\d\.\d (\d+)', response_content)
-                            status_code = status_match.group(1) if status_match else "200"
-                            
-                            streams[stream_id]['responses'].append({
-                                'content': response_content,
-                                'status_code': status_code,
-                                'timestamp': datetime.fromtimestamp(packet.time)
-                            })
-                        except:
-                            continue
-        
-        # Match requests with responses
-        for stream_id, stream_data in streams.items():
-            for request in stream_data['requests']:
-                # Find corresponding response (simplified matching)
-                response = None
-                for resp in stream_data['responses']:
-                    if abs((resp['timestamp'] - request['timestamp']).total_seconds()) < 5:  # 5-second window
-                        response = resp
-                        break
-                
-                sessions.append({
-                    'url': request['url'],
-                    'method': request['method'],
-                    'src_ip': request['src_ip'],
-                    'dst_ip': request['dst_ip'],
-                    'timestamp': request['timestamp'],
-                    'request_headers': request['full_request'],
-                    'response_content': response['content'] if response else None,
-                    'status_code': response['status_code'] if response else None,
-                    'stream_id': stream_id
-                })
-        
-        return sessions
+        return urls
     except Exception as e:
         st.error(f"Error parsing PCAP with Scapy: {str(e)}")
         return []
 
-def parse_pcap_with_dpkt_enhanced(pcap_file):
-    """Parse PCAP file using dpkt with enhanced session extraction"""
-    sessions = []
+def parse_pcap_simple_dpkt(pcap_file):
+    """Simple PCAP parsing using dpkt - handles various file formats"""
+    urls = []
     try:
         pcap_file.seek(0)
-        pcap = dpkt.pcap.Reader(pcap_file)
+        pcap_data = pcap_file.read()
         
-        streams = {}
+        # Try different pcap formats
+        try:
+            pcap = dpkt.pcap.Reader(io.BytesIO(pcap_data))
+        except ValueError:
+            # Try pcapng format
+            try:
+                pcap = dpkt.pcapng.Reader(io.BytesIO(pcap_data))
+            except ValueError as e:
+                st.error(f"Unsupported PCAP format: {e}")
+                return urls
         
         for timestamp, buf in pcap:
             try:
@@ -574,135 +511,149 @@ def parse_pcap_with_dpkt_enhanced(pcap_file):
                 
                 tcp = ip.data
                 
-                # Create stream identifier
-                if ip.src < ip.dst:
-                    stream_id = f"{dpkt.utils.inet_to_str(ip.src)}:{tcp.sport}-{dpkt.utils.inet_to_str(ip.dst)}:{tcp.dport}"
-                else:
-                    stream_id = f"{dpkt.utils.inet_to_str(ip.dst)}:{tcp.dport}-{dpkt.utils.inet_to_str(ip.src)}:{tcp.sport}"
-                
-                if stream_id not in streams:
-                    streams[stream_id] = {
-                        'src_ip': dpkt.utils.inet_to_str(ip.src),
-                        'dst_ip': dpkt.utils.inet_to_str(ip.dst),
-                        'src_port': tcp.sport,
-                        'dst_port': tcp.dport,
-                        'requests': [],
-                        'responses': []
-                    }
-                
-                if len(tcp.data) > 0:
-                    try:
-                        # Try to parse as HTTP request
-                        request = dpkt.http.Request(tcp.data)
-                        host = request.headers.get('host', '')
-                        uri = request.uri
-                        
-                        if host and uri:
-                            url = f"http://{host}{uri}"
-                            full_request = f"{request.method} {uri} HTTP/{request.version}\r\n"
-                            
-                            for header, value in request.headers.items():
-                                full_request += f"{header}: {value}\r\n"
-                            
-                            streams[stream_id]['requests'].append({
-                                'url': url,
-                                'method': request.method,
-                                'full_request': full_request,
-                                'timestamp': datetime.fromtimestamp(timestamp),
-                                'src_ip': dpkt.utils.inet_to_str(ip.src),
-                                'dst_ip': dpkt.utils.inet_to_str(ip.dst)
-                            })
-                    except:
+                # Check for HTTP on common ports
+                if tcp.dport in [80, 443, 8080, 8000] or tcp.sport in [80, 443, 8080, 8000]:
+                    if len(tcp.data) > 0:
                         try:
-                            # Try to parse as HTTP response
-                            response = dpkt.http.Response(tcp.data)
-                            response_content = tcp.data.decode('utf-8', errors='ignore')
-                            
-                            streams[stream_id]['responses'].append({
-                                'content': response_content,
-                                'status_code': response.status,
-                                'timestamp': datetime.fromtimestamp(timestamp)
-                            })
-                        except:
-                            # Raw payload analysis
                             payload = tcp.data.decode('utf-8', errors='ignore')
-                            if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                            
+                            # Look for HTTP requests
+                            if payload.startswith(('GET', 'POST', 'PUT', 'DELETE', 'HEAD')):
                                 lines = payload.split('\r\n')
                                 if lines:
                                     request_line = lines[0]
                                     parts = request_line.split()
                                     if len(parts) >= 2:
+                                        method = parts[0]
                                         path = parts[1]
                                         
+                                        # Extract host from headers
                                         host = ""
                                         for line in lines[1:]:
                                             if line.lower().startswith('host:'):
                                                 host = line.split(':', 1)[1].strip()
                                                 break
                                         
-                                        if host and path:
-                                            url = f"http://{host}{path}"
-                                            streams[stream_id]['requests'].append({
+                                        if host:
+                                            # Determine protocol
+                                            protocol = "https" if tcp.dport == 443 or tcp.sport == 443 else "http"
+                                            url = f"{protocol}://{host}{path}"
+                                            
+                                            url_info = {
                                                 'url': url,
-                                                'method': parts[0],
-                                                'full_request': payload,
-                                                'timestamp': datetime.fromtimestamp(timestamp),
+                                                'method': method,
                                                 'src_ip': dpkt.utils.inet_to_str(ip.src),
-                                                'dst_ip': dpkt.utils.inet_to_str(ip.dst)
-                                            })
-            except:
+                                                'dst_ip': dpkt.utils.inet_to_str(ip.dst),
+                                                'src_port': tcp.sport,
+                                                'dst_port': tcp.dport,
+                                                'timestamp': datetime.fromtimestamp(timestamp),
+                                                'raw_payload': payload[:1000]  # Store first 1000 chars
+                                            }
+                                            urls.append(url_info)
+                        except Exception as e:
+                            continue
+            except Exception as e:
                 continue
-        
-        # Match requests with responses
-        for stream_id, stream_data in streams.items():
-            for request in stream_data['requests']:
-                response = None
-                for resp in stream_data['responses']:
-                    if abs((resp['timestamp'] - request['timestamp']).total_seconds()) < 5:
-                        response = resp
-                        break
                 
-                sessions.append({
-                    'url': request['url'],
-                    'method': request['method'],
-                    'src_ip': request['src_ip'],
-                    'dst_ip': request['dst_ip'],
-                    'timestamp': request['timestamp'],
-                    'request_headers': request['full_request'],
-                    'response_content': response['content'] if response else None,
-                    'status_code': response['status_code'] if response else None,
-                    'stream_id': stream_id
-                })
-        
-        return sessions
+        return urls
     except Exception as e:
         st.error(f"Error parsing PCAP with dpkt: {str(e)}")
         return []
 
-def parse_pcap_file_enhanced(uploaded_file):
-    """Parse PCAP file and extract full HTTP sessions"""
-    sessions = []
+def parse_pcap_file_robust(uploaded_file):
+    """Robust PCAP parsing that handles various formats and errors"""
+    urls = []
     
+    st.info("🔄 Attempting to parse PCAP file...")
+    
+    # Try Scapy first
     if PCAP_SUPPORT:
-        with st.spinner("Parsing PCAP with Scapy (enhanced)..."):
-            temp_path = f"/tmp/{uploaded_file.name}"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getvalue())
-            
-            sessions = parse_pcap_with_scapy_enhanced(temp_path)
+        with st.spinner("Trying Scapy parser..."):
+            try:
+                urls = parse_pcap_simple_scapy(uploaded_file)
+                if urls:
+                    st.success(f"✅ Scapy extracted {len(urls)} URLs")
+                    return urls
+            except Exception as e:
+                st.warning(f"Scapy parser failed: {str(e)}")
     
-    if not sessions and DPKT_SUPPORT:
-        with st.spinner("Parsing PCAP with dpkt (enhanced)..."):
-            uploaded_file.seek(0)
-            sessions = parse_pcap_with_dpkt_enhanced(uploaded_file)
+    # Try dpkt if Scapy fails
+    if not urls and DPKT_SUPPORT:
+        with st.spinner("Trying dpkt parser..."):
+            try:
+                urls = parse_pcap_simple_dpkt(uploaded_file)
+                if urls:
+                    st.success(f"✅ dpkt extracted {len(urls)} URLs")
+                    return urls
+            except Exception as e:
+                st.warning(f"dpkt parser failed: {str(e)}")
     
-    if not sessions:
-        if not PCAP_SUPPORT and not DPKT_SUPPORT:
-            st.error("PCAP parsing requires scapy or dpkt libraries.")
-        else:
-            st.warning("No HTTP sessions found in PCAP file.")
+    # If both fail, try manual parsing as last resort
+    if not urls:
+        urls = parse_pcap_manual(uploaded_file)
     
-    return sessions
+    if not urls:
+        st.warning("❌ No HTTP URLs found in PCAP file. The file might be:")
+        st.warning("- Encrypted traffic (HTTPS)")
+        st.warning("- Non-HTTP protocol")
+        st.warning("- Corrupted or invalid PCAP format")
+        st.warning("- Empty or very small file")
+    
+    return urls
+
+def parse_pcap_manual(uploaded_file):
+    """Manual PCAP parsing as last resort"""
+    urls = []
+    try:
+        uploaded_file.seek(0)
+        data = uploaded_file.read()
+        
+        # Look for HTTP patterns in raw data
+        http_patterns = [
+            rb'GET /[^\s]* HTTP/1\.[01]',
+            rb'POST /[^\s]* HTTP/1\.[01]', 
+            rb'PUT /[^\s]* HTTP/1\.[01]',
+            rb'DELETE /[^\s]* HTTP/1\.[01]',
+            rb'HEAD /[^\s]* HTTP/1\.[01]'
+        ]
+        
+        for pattern in http_patterns:
+            matches = re.findall(pattern, data)
+            for match in matches:
+                try:
+                    match_str = match.decode('utf-8', errors='ignore')
+                    parts = match_str.split()
+                    if len(parts) >= 2:
+                        method = parts[0]
+                        path = parts[1]
+                        
+                        # Look for host in nearby data
+                        host_match = re.search(rb'Host: ([^\r\n]+)', data[data.find(match):data.find(match)+1000])
+                        if host_match:
+                            host = host_match.group(1).decode('utf-8', errors='ignore').strip()
+                            url = f"http://{host}{path}"
+                            
+                            url_info = {
+                                'url': url,
+                                'method': method,
+                                'src_ip': 'Unknown',
+                                'dst_ip': 'Unknown', 
+                                'src_port': 0,
+                                'dst_port': 0,
+                                'timestamp': datetime.now(),
+                                'raw_payload': match_str
+                            }
+                            urls.append(url_info)
+                except:
+                    continue
+        
+        if urls:
+            st.info(f"🔍 Manual extraction found {len(urls)} URLs")
+        
+    except Exception as e:
+        st.error(f"Manual PCAP parsing failed: {str(e)}")
+    
+    return urls
 
 # Export Functions
 def export_to_csv(data, filename):
@@ -731,7 +682,7 @@ def export_to_json(data, filename):
     if isinstance(data, pd.DataFrame):
         return data.to_json(orient='records', indent=2)
     else:
-        return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2, default=str)
 
 # Main Application
 def main():
@@ -1182,8 +1133,6 @@ def show_bulk_analysis():
     # Analysis options
     with st.expander("⚙️ Analysis Options", expanded=True):
         use_ai = st.checkbox("Enable Gemini AI Analysis", value=False, disabled=not st.session_state.api_key)
-        enhanced_pcap = st.checkbox("Enhanced PCAP Analysis", value=True, 
-                                   help="Extract full HTTP sessions with request/response pairs")
         if not st.session_state.api_key:
             st.info("💡 AI analysis disabled without API key in secrets (pattern-based detection will still work)")
         
@@ -1196,19 +1145,17 @@ def show_bulk_analysis():
         if st.button("🚀 Start Analysis", type="primary"):
             with st.spinner("Processing file..."):
                 try:
-                    sessions = []
                     urls = []
                     
                     # Read file based on type
                     if uploaded_file.name.endswith(('.pcap', '.pcapng')):
                         if PCAP_SUPPORT or DPKT_SUPPORT:
-                            if enhanced_pcap:
-                                sessions = parse_pcap_file_enhanced(uploaded_file)
-                                urls = [session['url'] for session in sessions if session.get('url')]
-                                st.info(f"📊 Extracted {len(sessions)} HTTP sessions from PCAP")
+                            urls = parse_pcap_file_robust(uploaded_file)
+                            if urls:
+                                st.success(f"📊 Successfully extracted {len(urls)} URLs from PCAP")
                             else:
-                                urls = parse_pcap_file(uploaded_file)
-                                st.info(f"📊 Extracted {len(urls)} URLs from PCAP")
+                                st.error("❌ Failed to extract URLs from PCAP file")
+                                return
                         else:
                             st.error("PCAP parsing requires scapy or dpkt.")
                             return
@@ -1244,69 +1191,47 @@ def show_bulk_analysis():
                         urls = [line.strip() for line in content.split('\n') if line.strip() and line.startswith('http')]
                         st.info(f"📊 Loaded {len(urls)} URLs from text file")
                     
-                    if not urls and not sessions:
-                        st.warning("No URLs or sessions found in file")
+                    if not urls:
+                        st.warning("No URLs found in file")
                         return
                     
-                    # Remove duplicates if processing URLs directly
-                    if urls and not sessions:
-                        urls = list(set(urls))
-                    
-                    total_items = len(sessions) if sessions else len(urls)
-                    st.info(f"🔍 Analyzing {total_items} items...")
+                    # Remove duplicates
+                    urls = list(set(urls))
+                    st.info(f"🔍 Analyzing {len(urls)} unique URLs...")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
                     results = []
-                    items_to_process = sessions if sessions else urls
                     
-                    for idx, item in enumerate(items_to_process):
-                        if sessions:
-                            # Process full session
-                            url = item['url']
-                            response_content = item.get('response_content')
-                            src_ip = item.get('src_ip')
-                            status_text.text(f"Analyzing {idx + 1}/{total_items}: {url[:50]}...")
-                        else:
-                            # Process URL only
-                            url = item
-                            response_content = None
-                            src_ip = extract_ip_from_url(url)
-                            status_text.text(f"Analyzing {idx + 1}/{total_items}: {url[:50]}...")
+                    for idx, url in enumerate(urls):
+                        status_text.text(f"Analyzing {idx + 1}/{len(urls)}: {url[:50]}...")
                         
                         # Extract IP information
+                        src_ip = extract_ip_from_url(url)
                         ip_info = get_ip_info(src_ip) if src_ip else {}
                         
                         quick_attacks, quick_indicators = quick_detection(url, st.session_state.attack_patterns_cache)
                         
-                        # Determine success if response content is available
-                        is_successful = False
-                        success_indicators = []
-                        if response_content and quick_attacks:
-                            is_successful, success_indicators = detect_attack_success(
-                                url, response_content, quick_attacks, st.session_state.attack_patterns_cache
-                            )
-                        
                         if use_ai and st.session_state.api_key and quick_attacks:
-                            gemini_result = analyze_with_gemini(url, quick_attacks, response_content)
+                            gemini_result = analyze_with_gemini(url, quick_attacks)
                             if gemini_result:
                                 attack_types = gemini_result.get('attack_types', quick_attacks)
                                 confidence = gemini_result.get('confidence', 0)
                                 severity = gemini_result.get('severity', determine_severity(attack_types))
-                                gemini_success = gemini_result.get('is_successful', is_successful)
-                                final_success = gemini_success if 'is_successful' in gemini_result else is_successful
+                                gemini_success = gemini_result.get('is_successful', False)
+                                final_success = gemini_success if 'is_successful' in gemini_result else False
                             else:
                                 attack_types = quick_attacks
                                 confidence = calculate_confidence(quick_indicators, None)
                                 severity = determine_severity(attack_types)
-                                final_success = is_successful
+                                final_success = False
                         else:
                             attack_types = quick_attacks
                             confidence = calculate_confidence(quick_indicators, None)
                             severity = determine_severity(attack_types)
-                            final_success = is_successful
+                            final_success = False
                         
                         if attack_types:
                             result = {
@@ -1318,18 +1243,8 @@ def show_bulk_analysis():
                                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 'model_used': st.session_state.selected_model if use_ai and st.session_state.api_key else "pattern_only",
                                 'src_ip': src_ip,
-                                'ip_info': ip_info,
-                                'success_indicators': success_indicators,
-                                'response_available': bool(response_content)
+                                'ip_info': ip_info
                             }
-                            
-                            if sessions:
-                                result.update({
-                                    'dst_ip': item.get('dst_ip'),
-                                    'method': item.get('method'),
-                                    'status_code': item.get('status_code'),
-                                    'stream_id': item.get('stream_id')
-                                })
                             
                             results.append(result)
                             st.session_state.attacks_db.append(result)
@@ -1338,13 +1253,13 @@ def show_bulk_analysis():
                             if st.session_state.mongo_db is not None:
                                 save_detection_to_db(st.session_state.mongo_db, result.copy())
                         
-                        progress_bar.progress((idx + 1) / total_items)
+                        progress_bar.progress((idx + 1) / len(urls))
                     
                     status_text.text("✅ Analysis complete!")
                     
                     # Display results
                     if results:
-                        st.success(f"🎯 Found {len(results)} potential attacks out of {total_items} items")
+                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
                         
                         # Summary statistics
                         col1, col2, col3, col4 = st.columns(4)
@@ -1400,12 +1315,14 @@ def show_bulk_analysis():
                                 mime="application/json"
                             )
                     else:
-                        st.success("✅ No attacks detected. All items appear safe!")
+                        st.success("✅ No attacks detected. All URLs appear safe!")
                 
                 except Exception as e:
                     st.error(f"Error processing file: {str(e)}")
                     import traceback
                     st.code(traceback.format_exc())
+
+# ... (The show_attack_database and show_visualizations functions remain the same as in the previous code)
 
 def show_attack_database():
     """Attack Database page"""
