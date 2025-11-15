@@ -82,6 +82,7 @@ if 'patterns_loaded' not in st.session_state:
 def connect_to_mongodb(connection_string):
     """Connect to MongoDB Atlas"""
     try:
+        connection_string="mongodb+srv://adhilbinmujeeb:NVYM5d67PHpkE7LA@cluster0.uz62z.mongodb.net/"
         client = MongoClient(connection_string, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
         db = client['cyber_attack_detection']
