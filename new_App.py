@@ -968,7 +968,7 @@ def show_attack_database():
     st.markdown(f"### 📊 Showing {len(filtered_attacks)} of {len(st.session_state.attacks_db)} attacks")
     
     # Display as dataframe
-    if filtered_attacks:
+    if len(filtered_attacks) > 0:
         df = pd.DataFrame(filtered_attacks)
         df['attack_types'] = df['attack_types'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x)
         
@@ -987,6 +987,8 @@ def show_attack_database():
             file_name=f"filtered_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv"
         )
+    else:
+        st.info("No attacks match the selected filters.")
 
 def show_visualizations():
     """Visualizations page"""
