@@ -739,33 +739,272 @@ def enhanced_url_analysis(url, use_gemini=True, server_response=None, response_c
     return analysis_record
 
 # Enhanced PCAP Analysis
+# Enhanced PCAP Analysis with Error Handling
 def extract_urls_with_ips_from_pcap(pcap_file):
-    """Extract URLs with source IPs from PCAP file"""
+    """Extract URLs with source IPs from PCAP file with robust error handling"""
     urls_with_ips = []
     
-    if PCAP_SUPPORT:
+    if not PCAP_SUPPORT:
+        st.warning("⚠️ Scapy not available for PCAP parsing")
+        return urls_with_ips
+    
+    try:
+        # Save uploaded file to temporary location
+        temp_path = f"/tmp/{pcap_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(pcap_file.getvalue())
+        
+        # Use different approach to read PCAP
+        packets = []
         try:
-            packets = rdpcap(pcap_file)
-            
-            for packet in packets:
-                if packet.haslayer(HTTPRequest) and packet.haslayer(IP):
-                    http_layer = packet[HTTPRequest]
+            packets = rdpcap(temp_path)
+        except Exception as e:
+            st.warning(f"Scapy rdpcap failed: {str(e)}. Trying alternative method...")
+            # Try reading with different parameters
+            try:
+                packets = rdpcap(temp_path, count=1000)  # Limit packets for large files
+            except:
+                st.error("Failed to parse PCAP file with Scapy")
+                return urls_with_ips
+        
+        packet_count = 0
+        for packet in packets:
+            if packet_count >= 1000:  # Limit processing for large files
+                break
+                
+            try:
+                # Check for IP and TCP layers
+                if packet.haslayer(IP) and packet.haslayer(TCP):
                     ip_layer = packet[IP]
-                    
-                    host = http_layer.Host.decode() if http_layer.Host else ""
-                    path = http_layer.Path.decode() if http_layer.Path else ""
                     source_ip = ip_layer.src
                     
-                    if host and path:
-                        url = f"http://{host}{path}"
-                        urls_with_ips.append({
-                            'url': url,
-                            'source_ip': source_ip,
-                            'timestamp': datetime.fromtimestamp(packet.time).strftime("%Y-%m-%d %H:%M:%S")
-                        })
+                    # Check for HTTP request
+                    if packet.haslayer(HTTPRequest):
+                        http_layer = packet[HTTPRequest]
+                        host = http_layer.Host.decode() if http_layer.Host else ""
+                        path = http_layer.Path.decode() if http_layer.Path else ""
                         
-        except Exception as e:
-            st.error(f"Error parsing PCAP with Scapy: {str(e)}")
+                        if host and path:
+                            url = f"http://{host}{path}"
+                            urls_with_ips.append({
+                                'url': url,
+                                'source_ip': source_ip,
+                                'timestamp': datetime.fromtimestamp(packet.time).strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            packet_count += 1
+                    
+                    # Also check raw TCP payload for HTTP requests
+                    elif packet.haslayer(Raw):
+                        try:
+                            payload = packet[Raw].load
+                            payload_str = payload.decode('utf-8', errors='ignore')
+                            
+                            # Look for HTTP methods in payload
+                            if any(method in payload_str for method in ['GET ', 'POST ', 'PUT ', 'DELETE ']):
+                                lines = payload_str.split('\r\n')
+                                if lines and any(line.startswith(('GET', 'POST', 'PUT', 'DELETE')) for line in lines):
+                                    request_line = lines[0]
+                                    parts = request_line.split()
+                                    if len(parts) >= 2:
+                                        path = parts[1]
+                                        host = ""
+                                        for line in lines[1:]:
+                                            if line.lower().startswith('host:'):
+                                                host = line.split(':', 1)[1].strip()
+                                                break
+                                        
+                                        if host and path:
+                                            url = f"http://{host}{path}"
+                                            urls_with_ips.append({
+                                                'url': url,
+                                                'source_ip': source_ip,
+                                                'timestamp': datetime.fromtimestamp(packet.time).strftime("%Y-%m-%d %H:%M:%S")
+                                            })
+                                            packet_count += 1
+                        except:
+                            continue
+                            
+            except Exception as e:
+                continue  # Skip problematic packets
+        
+        # Clean up temp file
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+            
+    except Exception as e:
+        st.error(f"Error parsing PCAP: {str(e)}")
+    
+    return urls_with_ips
+
+def parse_pcap_with_dpkt_enhanced(pcap_file):
+    """Enhanced dpkt PCAP parsing as fallback"""
+    urls_with_ips = []
+    
+    if not DPKT_SUPPORT:
+        return urls_with_ips
+    
+    try:
+        pcap_file.seek(0)
+        pcap_data = pcap_file.getvalue()
+        pcap = dpkt.pcap.Reader(io.BytesIO(pcap_data))
+        
+        for timestamp, buf in pcap:
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                
+                if not isinstance(eth.data, dpkt.ip.IP):
+                    continue
+                
+                ip = eth.data
+                source_ip = dpkt.utils.inet_to_str(ip.src)
+                
+                if not isinstance(ip.data, dpkt.tcp.TCP):
+                    continue
+                
+                tcp = ip.data
+                
+                if len(tcp.data) > 0:
+                    try:
+                        # Try to parse as HTTP request
+                        request = dpkt.http.Request(tcp.data)
+                        host = request.headers.get('host', '')
+                        uri = request.uri
+                        
+                        if host and uri:
+                            url = f"http://{host}{uri}"
+                            urls_with_ips.append({
+                                'url': url,
+                                'source_ip': source_ip,
+                                'timestamp': datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                    except:
+                        # Manual HTTP parsing
+                        try:
+                            payload = tcp.data.decode('utf-8', errors='ignore')
+                            if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                                lines = payload.split('\r\n')
+                                if lines:
+                                    request_line = lines[0]
+                                    parts = request_line.split()
+                                    if len(parts) >= 2:
+                                        path = parts[1]
+                                        host = ""
+                                        for line in lines[1:]:
+                                            if line.lower().startswith('host:'):
+                                                host = line.split(':', 1)[1].strip()
+                                                break
+                                        
+                                        if host and path:
+                                            url = f"http://{host}{path}"
+                                            urls_with_ips.append({
+                                                'url': url,
+                                                'source_ip': source_ip,
+                                                'timestamp': datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                                            })
+                        except:
+                            continue
+            except:
+                continue
+                
+    except Exception as e:
+        st.error(f"Error parsing PCAP with dpkt: {str(e)}")
+    
+    return urls_with_ips
+
+def enhanced_pcap_analysis(uploaded_file, use_gemini=True):
+    """Robust PCAP analysis with multiple fallback methods"""
+    urls_with_ips = []
+    
+    # Try Scapy first
+    if PCAP_SUPPORT:
+        with st.spinner("🔄 Parsing PCAP with Scapy..."):
+            urls_with_ips = extract_urls_with_ips_from_pcap(uploaded_file)
+    
+    # Fallback to dpkt if Scapy fails or finds nothing
+    if not urls_with_ips and DPKT_SUPPORT:
+        with st.spinner("🔄 Trying dpkt PCAP parsing..."):
+            urls_with_ips = parse_pcap_with_dpkt_enhanced(uploaded_file)
+    
+    # If still no results, try manual text extraction
+    if not urls_with_ips:
+        with st.spinner("🔄 Attempting manual PCAP analysis..."):
+            urls_with_ips = manual_pcap_extraction(uploaded_file)
+    
+    if not urls_with_ips:
+        st.warning("⚠️ No HTTP URLs extracted from PCAP file. The file may contain:")
+        st.write("- Encrypted HTTPS traffic (cannot be parsed)")
+        st.write("- Non-HTTP protocols")
+        st.write("- Corrupted or incomplete PCAP data")
+        st.write("- Very large file (processing limited to first 1000 packets)")
+        return []
+    
+    st.success(f"✅ Extracted {len(urls_with_ips)} URLs from PCAP")
+    
+    # Analyze extracted URLs
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, url_data in enumerate(urls_with_ips):
+        status_text.text(f"Analyzing {idx + 1}/{len(urls_with_ips)}: {url_data['url'][:50]}...")
+        
+        result = enhanced_url_analysis(
+            url=url_data['url'],
+            use_gemini=use_gemini,
+            source_ip=url_data['source_ip'],
+            server_response=None,
+            response_code=None
+        )
+        
+        results.append(result)
+        progress_bar.progress((idx + 1) / len(urls_with_ips))
+    
+    status_text.text("✅ PCAP analysis complete!")
+    return results
+
+def manual_pcap_extraction(uploaded_file):
+    """Manual PCAP extraction as last resort"""
+    urls_with_ips = []
+    
+    try:
+        # Read file as binary and look for HTTP patterns
+        content = uploaded_file.getvalue()
+        content_str = content.decode('latin-1')  # Use latin-1 to handle binary data
+        
+        # Look for HTTP request patterns
+        http_patterns = [
+            r'GET\s+([^\s]+)\s+HTTP/1\.[01]',
+            r'POST\s+([^\s]+)\s+HTTP/1\.[01]', 
+            r'Host:\s*([^\r\n]+)'
+        ]
+        
+        # Simple IP pattern (basic)
+        ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+        
+        # Extract potential URLs and IPs
+        import re
+        get_matches = re.findall(r'GET\s+([^\s]+)\s+HTTP/1\.[01]', content_str)
+        host_matches = re.findall(r'Host:\s*([^\r\n]+)', content_str)
+        ip_matches = re.findall(ip_pattern, content_str)
+        
+        # Create URL objects with dummy IPs
+        for i, (path, host) in enumerate(zip(get_matches, host_matches)):
+            if i < len(ip_matches):
+                source_ip = ip_matches[i]
+            else:
+                source_ip = "192.168.1.100"  # Default IP
+            
+            url = f"http://{host.strip()}{path}"
+            urls_with_ips.append({
+                'url': url,
+                'source_ip': source_ip,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            
+    except Exception as e:
+        st.error(f"Manual extraction failed: {str(e)}")
     
     return urls_with_ips
 
