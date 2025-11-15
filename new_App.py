@@ -11,11 +11,13 @@ import time
 import io
 from pymongo import MongoClient
 import pymongo
+import ipaddress
+import csv
 
 # Try to import PCAP libraries
 try:
-    from scapy.all import rdpcap, TCP, Raw
-    from scapy.layers.http import HTTPRequest
+    from scapy.all import rdpcap, TCP, Raw, IP
+    from scapy.layers.http import HTTPRequest, HTTPResponse
     PCAP_SUPPORT = True
 except ImportError:
     PCAP_SUPPORT = False
@@ -58,6 +60,21 @@ st.markdown("""
         background-color: #f8f9fa;
         border-radius: 5px;
     }
+    .model-info {
+        background-color: #f0f8ff;
+        padding: 0.5rem;
+        border-radius: 5px;
+        margin: 0.25rem 0;
+        font-size: 0.85rem;
+    }
+    .success-attack {
+        border-left: 4px solid #FF0000;
+        background-color: #ffe6e6;
+    }
+    .attempt-attack {
+        border-left: 4px solid #FFA500;
+        background-color: #fff0e6;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -78,6 +95,75 @@ if 'patterns_loaded' not in st.session_state:
     st.session_state.patterns_loaded = False
 if 'secrets_configured' not in st.session_state:
     st.session_state.secrets_configured = False
+if 'selected_model' not in st.session_state:
+    st.session_state.selected_model = "gemini-2.0-flash"
+
+# Define available Gemini models with their specifications
+GEMINI_MODELS = {
+    "gemini-2.5-pro": {
+        "name": "Gemini 2.5 Pro",
+        "rate_limit": 2,
+        "context_window": 125000,
+        "daily_limit": 50,
+        "description": "Most capable model for complex reasoning tasks"
+    },
+    "gemini-2.5-flash": {
+        "name": "Gemini 2.5 Flash",
+        "rate_limit": 10,
+        "context_window": 250000,
+        "daily_limit": 250,
+        "description": "Fast and versatile for most tasks"
+    },
+    "gemini-2.5-flash-preview": {
+        "name": "Gemini 2.5 Flash Preview",
+        "rate_limit": 10,
+        "context_window": 250000,
+        "daily_limit": 250,
+        "description": "Preview version with extended capabilities"
+    },
+    "gemini-2.5-flash-lite": {
+        "name": "Gemini 2.5 Flash-Lite",
+        "rate_limit": 15,
+        "context_window": 250000,
+        "daily_limit": 1000,
+        "description": "Lightweight and cost-effective"
+    },
+    "gemini-2.5-flash-lite-preview": {
+        "name": "Gemini 2.5 Flash-Lite Preview",
+        "rate_limit": 15,
+        "context_window": 250000,
+        "daily_limit": 1000,
+        "description": "Preview of lightweight model"
+    },
+    "gemini-2.0-flash": {
+        "name": "Gemini 2.0 Flash",
+        "rate_limit": 15,
+        "context_window": 1000000,
+        "daily_limit": 200,
+        "description": "Previous generation fast model"
+    },
+    "gemini-2.0-flash-lite": {
+        "name": "Gemini 2.0 Flash-Lite",
+        "rate_limit": 30,
+        "context_window": 1000000,
+        "daily_limit": 200,
+        "description": "Previous generation lightweight"
+    },
+    "gemini-1.5-flash": {
+        "name": "Gemini 1.5 Flash",
+        "rate_limit": 15,
+        "context_window": 1000000,
+        "daily_limit": 1500,
+        "description": "Widely available and reliable"
+    },
+    "gemini-1.5-pro": {
+        "name": "Gemini 1.5 Pro",
+        "rate_limit": 2,
+        "context_window": 2000000,
+        "daily_limit": 50,
+        "description": "High-quality reasoning with large context"
+    }
+}
 
 # MongoDB Functions
 @st.cache_resource
@@ -104,7 +190,8 @@ def load_attack_patterns_from_db(db):
                 'category': doc.get('category'),
                 'severity': doc.get('severity'),
                 'patterns': doc.get('patterns', []),
-                'mitigation': doc.get('mitigation', [])
+                'mitigation': doc.get('mitigation', []),
+                'success_indicators': doc.get('success_indicators', [])
             }
         
         return patterns
@@ -123,7 +210,7 @@ def save_detection_to_db(db, detection_record):
         st.error(f"Error saving to MongoDB: {str(e)}")
         return False
 
-def get_detection_history_from_db(db, limit=100):
+def get_detection_history_from_db(db, limit=1000):
     """Get detection history from MongoDB"""
     try:
         collection = db['detection_results']
@@ -183,6 +270,44 @@ def initialize_from_secrets():
     except Exception as e:
         st.error(f"Error initializing from secrets: {str(e)}")
 
+# IP Address Functions
+def extract_ip_from_url(url):
+    """Extract IP addresses from URL"""
+    ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+    ips = re.findall(ip_pattern, url)
+    return ips[0] if ips else None
+
+def is_ip_in_range(ip, ip_range):
+    """Check if IP is within specified range"""
+    try:
+        if '/' in ip_range:
+            # CIDR notation
+            network = ipaddress.ip_network(ip_range, strict=False)
+            return ipaddress.ip_address(ip) in network
+        elif '-' in ip_range:
+            # IP range like 192.168.1.1-192.168.1.100
+            start_ip, end_ip = ip_range.split('-')
+            return ipaddress.ip_address(start_ip.strip()) <= ipaddress.ip_address(ip) <= ipaddress.ip_address(end_ip.strip())
+        else:
+            # Single IP
+            return ip == ip_range
+    except:
+        return False
+
+def get_ip_info(ip):
+    """Get basic IP information (can be extended with GeoIP)"""
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return {
+            'ip': ip,
+            'version': ip_obj.version,
+            'is_private': ip_obj.is_private,
+            'is_global': ip_obj.is_global,
+            'is_multicast': ip_obj.is_multicast
+        }
+    except:
+        return {'ip': ip, 'version': 'unknown'}
+
 # Attack Detection Functions using MongoDB patterns
 def detect_attack_with_patterns(url, attack_id, patterns_data):
     """Generic attack detection using MongoDB patterns"""
@@ -205,6 +330,26 @@ def detect_attack_with_patterns(url, attack_id, patterns_data):
     
     return len(indicators) > 0, indicators
 
+def detect_attack_success(url, response_content, attack_types, patterns_data):
+    """Determine if attack was successful based on response patterns"""
+    success_indicators = []
+    is_successful = False
+    
+    for attack_type in attack_types:
+        for attack_id, info in patterns_data.items():
+            if info['category'] == attack_type and 'success_indicators' in info:
+                for indicator in info['success_indicators']:
+                    pattern = indicator.get('regex', '')
+                    description = indicator.get('description', '')
+                    try:
+                        if response_content and re.search(pattern, response_content, re.IGNORECASE):
+                            success_indicators.append(description)
+                            is_successful = True
+                    except re.error:
+                        continue
+    
+    return is_successful, success_indicators
+
 def quick_detection(url, patterns_data):
     """Quick pattern-based detection using MongoDB patterns"""
     if not patterns_data:
@@ -224,27 +369,31 @@ def quick_detection(url, patterns_data):
     
     return detected_attacks, all_indicators
 
-def analyze_with_gemini(url, quick_results):
+def analyze_with_gemini(url, quick_results, response_content=None):
     """Analyze URL with Google Gemini API"""
     if not st.session_state.api_key:
         return None
     
     try:
-        # Use the latest model that's available
-        model = genai.GenerativeModel('gemini-pro')
+        # Use the selected model
+        model = genai.GenerativeModel(st.session_state.selected_model)
+        
+        response_info = f"Response content: {response_content[:500]}..." if response_content else "No response content available"
         
         prompt = f"""As a cybersecurity expert, analyze this URL for potential attacks:
 
 URL: {url}
 
 Pre-detected patterns: {', '.join(quick_results) if quick_results else 'None'}
+{response_info}
 
-Identify attack type(s) and provide response in this exact JSON format:
+Determine if the attack was successful and provide response in this exact JSON format:
 {{
     "is_malicious": true/false,
     "attack_types": ["type1", "type2"],
     "confidence": 0-100,
     "severity": "LOW/MEDIUM/HIGH/CRITICAL",
+    "is_successful": true/false,
     "explanation": "brief technical explanation",
     "recommendations": ["recommendation1", "recommendation2"]
 }}
@@ -304,59 +453,112 @@ def determine_severity(attack_types):
     
     return "LOW"
 
-# PCAP Parsing Functions
-def parse_pcap_with_scapy(pcap_file):
-    """Parse PCAP file using Scapy"""
-    urls = []
+# Enhanced PCAP Parsing Functions
+def parse_pcap_with_scapy_enhanced(pcap_file):
+    """Parse PCAP file using Scapy with full HTTP session extraction"""
+    sessions = []
     try:
         packets = rdpcap(pcap_file)
         
+        # Group packets by TCP stream
+        streams = {}
         for packet in packets:
-            if packet.haslayer(HTTPRequest):
-                http_layer = packet[HTTPRequest]
-                host = http_layer.Host.decode() if http_layer.Host else ""
-                path = http_layer.Path.decode() if http_layer.Path else ""
+            if packet.haslayer(IP) and packet.haslayer(TCP):
+                # Create stream identifier
+                if packet[IP].src < packet[IP].dst:
+                    stream_id = f"{packet[IP].src}:{packet[TCP].sport}-{packet[IP].dst}:{packet[TCP].dport}"
+                else:
+                    stream_id = f"{packet[IP].dst}:{packet[TCP].dport}-{packet[IP].src}:{packet[TCP].sport}"
                 
-                if host and path:
-                    url = f"http://{host}{path}"
-                    urls.append(url)
-            
-            elif packet.haslayer(TCP) and packet.haslayer(Raw):
-                payload = packet[Raw].load
-                try:
-                    payload_str = payload.decode('utf-8', errors='ignore')
+                if stream_id not in streams:
+                    streams[stream_id] = {
+                        'src_ip': packet[IP].src,
+                        'dst_ip': packet[IP].dst,
+                        'src_port': packet[TCP].sport,
+                        'dst_port': packet[TCP].dport,
+                        'requests': [],
+                        'responses': []
+                    }
+                
+                # Check for HTTP request
+                if packet.haslayer(HTTPRequest):
+                    http_layer = packet[HTTPRequest]
+                    host = http_layer.Host.decode() if http_layer.Host else ""
+                    path = http_layer.Path.decode() if http_layer.Path else ""
+                    method = http_layer.Method.decode() if http_layer.Method else "GET"
                     
-                    if payload_str.startswith(('GET', 'POST', 'PUT', 'DELETE')):
-                        lines = payload_str.split('\r\n')
-                        if lines:
-                            request_line = lines[0]
-                            parts = request_line.split()
-                            if len(parts) >= 2:
-                                path = parts[1]
-                                
-                                host = ""
-                                for line in lines[1:]:
-                                    if line.lower().startswith('host:'):
-                                        host = line.split(':', 1)[1].strip()
-                                        break
-                                
-                                if host and path:
-                                    url = f"http://{host}{path}"
-                                    urls.append(url)
-                except:
-                    continue
+                    if host and path:
+                        url = f"http://{host}{path}"
+                        full_request = f"{method} {path} HTTP/1.1\r\nHost: {host}\r\n"
+                        
+                        # Add headers
+                        for field in http_layer.fields:
+                            if field != 'Method' and field != 'Path' and field != 'Http-Version':
+                                value = http_layer.fields[field]
+                                if isinstance(value, bytes):
+                                    value = value.decode()
+                                full_request += f"{field}: {value}\r\n"
+                        
+                        streams[stream_id]['requests'].append({
+                            'url': url,
+                            'method': method,
+                            'full_request': full_request,
+                            'timestamp': datetime.fromtimestamp(packet.time),
+                            'src_ip': packet[IP].src,
+                            'dst_ip': packet[IP].dst
+                        })
+                
+                # Check for HTTP response
+                elif packet.haslayer(HTTPResponse):
+                    if packet.haslayer(Raw):
+                        try:
+                            response_content = packet[Raw].load.decode('utf-8', errors='ignore')
+                            status_match = re.search(r'HTTP/\d\.\d (\d+)', response_content)
+                            status_code = status_match.group(1) if status_match else "200"
+                            
+                            streams[stream_id]['responses'].append({
+                                'content': response_content,
+                                'status_code': status_code,
+                                'timestamp': datetime.fromtimestamp(packet.time)
+                            })
+                        except:
+                            continue
         
-        return urls
+        # Match requests with responses
+        for stream_id, stream_data in streams.items():
+            for request in stream_data['requests']:
+                # Find corresponding response (simplified matching)
+                response = None
+                for resp in stream_data['responses']:
+                    if abs((resp['timestamp'] - request['timestamp']).total_seconds()) < 5:  # 5-second window
+                        response = resp
+                        break
+                
+                sessions.append({
+                    'url': request['url'],
+                    'method': request['method'],
+                    'src_ip': request['src_ip'],
+                    'dst_ip': request['dst_ip'],
+                    'timestamp': request['timestamp'],
+                    'request_headers': request['full_request'],
+                    'response_content': response['content'] if response else None,
+                    'status_code': response['status_code'] if response else None,
+                    'stream_id': stream_id
+                })
+        
+        return sessions
     except Exception as e:
         st.error(f"Error parsing PCAP with Scapy: {str(e)}")
         return []
 
-def parse_pcap_with_dpkt(pcap_file):
-    """Parse PCAP file using dpkt"""
-    urls = []
+def parse_pcap_with_dpkt_enhanced(pcap_file):
+    """Parse PCAP file using dpkt with enhanced session extraction"""
+    sessions = []
     try:
         pcap_file.seek(0)
         pcap = dpkt.pcap.Reader(pcap_file)
+        
+        streams = {}
         
         for timestamp, buf in pcap:
             try:
@@ -372,66 +574,164 @@ def parse_pcap_with_dpkt(pcap_file):
                 
                 tcp = ip.data
                 
+                # Create stream identifier
+                if ip.src < ip.dst:
+                    stream_id = f"{dpkt.utils.inet_to_str(ip.src)}:{tcp.sport}-{dpkt.utils.inet_to_str(ip.dst)}:{tcp.dport}"
+                else:
+                    stream_id = f"{dpkt.utils.inet_to_str(ip.dst)}:{tcp.dport}-{dpkt.utils.inet_to_str(ip.src)}:{tcp.sport}"
+                
+                if stream_id not in streams:
+                    streams[stream_id] = {
+                        'src_ip': dpkt.utils.inet_to_str(ip.src),
+                        'dst_ip': dpkt.utils.inet_to_str(ip.dst),
+                        'src_port': tcp.sport,
+                        'dst_port': tcp.dport,
+                        'requests': [],
+                        'responses': []
+                    }
+                
                 if len(tcp.data) > 0:
                     try:
+                        # Try to parse as HTTP request
                         request = dpkt.http.Request(tcp.data)
                         host = request.headers.get('host', '')
                         uri = request.uri
                         
                         if host and uri:
                             url = f"http://{host}{uri}"
-                            urls.append(url)
+                            full_request = f"{request.method} {uri} HTTP/{request.version}\r\n"
+                            
+                            for header, value in request.headers.items():
+                                full_request += f"{header}: {value}\r\n"
+                            
+                            streams[stream_id]['requests'].append({
+                                'url': url,
+                                'method': request.method,
+                                'full_request': full_request,
+                                'timestamp': datetime.fromtimestamp(timestamp),
+                                'src_ip': dpkt.utils.inet_to_str(ip.src),
+                                'dst_ip': dpkt.utils.inet_to_str(ip.dst)
+                            })
                     except:
-                        payload = tcp.data.decode('utf-8', errors='ignore')
-                        if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
-                            lines = payload.split('\r\n')
-                            if lines:
-                                request_line = lines[0]
-                                parts = request_line.split()
-                                if len(parts) >= 2:
-                                    path = parts[1]
-                                    
-                                    host = ""
-                                    for line in lines[1:]:
-                                        if line.lower().startswith('host:'):
-                                            host = line.split(':', 1)[1].strip()
-                                            break
-                                    
-                                    if host and path:
-                                        url = f"http://{host}{path}"
-                                        urls.append(url)
+                        try:
+                            # Try to parse as HTTP response
+                            response = dpkt.http.Response(tcp.data)
+                            response_content = tcp.data.decode('utf-8', errors='ignore')
+                            
+                            streams[stream_id]['responses'].append({
+                                'content': response_content,
+                                'status_code': response.status,
+                                'timestamp': datetime.fromtimestamp(timestamp)
+                            })
+                        except:
+                            # Raw payload analysis
+                            payload = tcp.data.decode('utf-8', errors='ignore')
+                            if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                                lines = payload.split('\r\n')
+                                if lines:
+                                    request_line = lines[0]
+                                    parts = request_line.split()
+                                    if len(parts) >= 2:
+                                        path = parts[1]
+                                        
+                                        host = ""
+                                        for line in lines[1:]:
+                                            if line.lower().startswith('host:'):
+                                                host = line.split(':', 1)[1].strip()
+                                                break
+                                        
+                                        if host and path:
+                                            url = f"http://{host}{path}"
+                                            streams[stream_id]['requests'].append({
+                                                'url': url,
+                                                'method': parts[0],
+                                                'full_request': payload,
+                                                'timestamp': datetime.fromtimestamp(timestamp),
+                                                'src_ip': dpkt.utils.inet_to_str(ip.src),
+                                                'dst_ip': dpkt.utils.inet_to_str(ip.dst)
+                                            })
             except:
                 continue
         
-        return urls
+        # Match requests with responses
+        for stream_id, stream_data in streams.items():
+            for request in stream_data['requests']:
+                response = None
+                for resp in stream_data['responses']:
+                    if abs((resp['timestamp'] - request['timestamp']).total_seconds()) < 5:
+                        response = resp
+                        break
+                
+                sessions.append({
+                    'url': request['url'],
+                    'method': request['method'],
+                    'src_ip': request['src_ip'],
+                    'dst_ip': request['dst_ip'],
+                    'timestamp': request['timestamp'],
+                    'request_headers': request['full_request'],
+                    'response_content': response['content'] if response else None,
+                    'status_code': response['status_code'] if response else None,
+                    'stream_id': stream_id
+                })
+        
+        return sessions
     except Exception as e:
         st.error(f"Error parsing PCAP with dpkt: {str(e)}")
         return []
 
-def parse_pcap_file(uploaded_file):
-    """Parse PCAP file and extract URLs"""
-    urls = []
+def parse_pcap_file_enhanced(uploaded_file):
+    """Parse PCAP file and extract full HTTP sessions"""
+    sessions = []
     
     if PCAP_SUPPORT:
-        with st.spinner("Parsing PCAP with Scapy..."):
+        with st.spinner("Parsing PCAP with Scapy (enhanced)..."):
             temp_path = f"/tmp/{uploaded_file.name}"
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getvalue())
             
-            urls = parse_pcap_with_scapy(temp_path)
+            sessions = parse_pcap_with_scapy_enhanced(temp_path)
     
-    if not urls and DPKT_SUPPORT:
-        with st.spinner("Parsing PCAP with dpkt..."):
+    if not sessions and DPKT_SUPPORT:
+        with st.spinner("Parsing PCAP with dpkt (enhanced)..."):
             uploaded_file.seek(0)
-            urls = parse_pcap_with_dpkt(uploaded_file)
+            sessions = parse_pcap_with_dpkt_enhanced(uploaded_file)
     
-    if not urls:
+    if not sessions:
         if not PCAP_SUPPORT and not DPKT_SUPPORT:
             st.error("PCAP parsing requires scapy or dpkt libraries.")
         else:
-            st.warning("No HTTP URLs found in PCAP file.")
+            st.warning("No HTTP sessions found in PCAP file.")
     
-    return urls
+    return sessions
+
+# Export Functions
+def export_to_csv(data, filename):
+    """Export data to CSV format"""
+    if not data:
+        return None
+    
+    output = io.StringIO()
+    
+    if isinstance(data, pd.DataFrame):
+        data.to_csv(output, index=False)
+    else:
+        # Convert list of dictionaries to CSV
+        if data and isinstance(data[0], dict):
+            fieldnames = data[0].keys()
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+        else:
+            return None
+    
+    return output.getvalue()
+
+def export_to_json(data, filename):
+    """Export data to JSON format"""
+    if isinstance(data, pd.DataFrame):
+        return data.to_json(orient='records', indent=2)
+    else:
+        return json.dumps(data, indent=2)
 
 # Main Application
 def main():
@@ -463,6 +763,40 @@ def main():
         
         st.markdown("---")
         
+        # Gemini Model Selection
+        st.subheader("🤖 Gemini Model Selection")
+        
+        # Model selection with detailed info
+        model_options = list(GEMINI_MODELS.keys())
+        model_display_names = [f"{GEMINI_MODELS[model]['name']} ({model})" for model in model_options]
+        
+        selected_model_display = st.selectbox(
+            "Select Model",
+            options=model_display_names,
+            index=model_display_names.index(f"{GEMINI_MODELS[st.session_state.selected_model]['name']} ({st.session_state.selected_model})")
+        )
+        
+        # Extract model ID from display name
+        selected_model_id = model_options[model_display_names.index(selected_model_display)]
+        
+        if selected_model_id != st.session_state.selected_model:
+            st.session_state.selected_model = selected_model_id
+            st.rerun()
+        
+        # Display model specifications
+        model_info = GEMINI_MODELS[st.session_state.selected_model]
+        st.markdown(f"""
+        <div class="model-info">
+        <strong>📊 Model Specifications:</strong><br>
+        • Rate Limit: {model_info['rate_limit']} RPM<br>
+        • Context: {model_info['context_window']:,} tokens<br>
+        • Daily Limit: {model_info['daily_limit']} requests<br>
+        • Description: {model_info['description']}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
         # Navigation
         page = st.radio("Navigation", [
             "🏠 Dashboard",
@@ -476,8 +810,12 @@ def main():
         
         # Stats
         if st.session_state.attacks_db:
-            st.metric("Total Attacks", len(st.session_state.attacks_db))
+            total_attacks = len(st.session_state.attacks_db)
+            successful_attacks = len([a for a in st.session_state.attacks_db if a.get('is_successful')])
             critical_count = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
+            
+            st.metric("Total Attacks", total_attacks)
+            st.metric("Successful Attacks", successful_attacks)
             st.metric("Critical Threats", critical_count)
     
     # Main Content
@@ -513,11 +851,18 @@ def show_dashboard():
         """)
         return
     
+    # Display current model info
+    current_model = GEMINI_MODELS[st.session_state.selected_model]
+    st.info(f"🤖 **Current Model**: {current_model['name']} | 📊 **Context**: {current_model['context_window']:,} tokens | ⚡ **Rate Limit**: {current_model['rate_limit']} RPM")
+    
     # Stats Cards
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     total_analyzed = len(st.session_state.analysis_history)
     total_attacks = len(st.session_state.attacks_db)
+    successful_attacks = len([a for a in st.session_state.attacks_db if a.get('is_successful')])
+    attempted_attacks = total_attacks - successful_attacks
+    critical_count = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
     
     with col1:
         st.metric("📊 Total Analyzed", total_analyzed)
@@ -526,15 +871,13 @@ def show_dashboard():
         st.metric("⚠️ Attacks Detected", total_attacks)
     
     with col3:
-        if total_analyzed > 0:
-            rate = (total_attacks / total_analyzed) * 100
-            st.metric("🎯 Detection Rate", f"{rate:.1f}%")
-        else:
-            st.metric("🎯 Detection Rate", "0%")
+        st.metric("✅ Successful", successful_attacks)
     
     with col4:
-        critical = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
-        st.metric("🔴 Critical Threats", critical)
+        st.metric("🔄 Attempted", attempted_attacks)
+    
+    with col5:
+        st.metric("🔴 Critical", critical_count)
     
     st.markdown("---")
     
@@ -560,19 +903,20 @@ def show_dashboard():
             st.info("No attacks detected yet")
     
     with col2:
-        st.subheader("🎯 Severity Distribution")
+        st.subheader("🎯 Success vs Attempt")
         if st.session_state.attacks_db:
-            severities = [a.get('severity', 'UNKNOWN') for a in st.session_state.attacks_db]
-            severity_counts = Counter(severities)
-            
-            df = pd.DataFrame(list(severity_counts.items()), columns=['Severity', 'Count'])
-            colors = {'CRITICAL': '#FF4444', 'HIGH': '#FF8844', 'MEDIUM': '#FFBB44', 'LOW': '#44FF44'}
-            fig = px.bar(df, x='Severity', y='Count', color='Severity',
-                        color_discrete_map=colors)
-            fig.update_layout(height=350, showlegend=False)
+            success_data = {
+                'Status': ['Successful', 'Attempted'],
+                'Count': [successful_attacks, attempted_attacks]
+            }
+            df = pd.DataFrame(success_data)
+            colors = ['#FF4444', '#FFA500']
+            fig = px.pie(df, values='Count', names='Status', color='Status',
+                        color_discrete_map={'Successful': '#FF4444', 'Attempted': '#FFA500'})
+            fig.update_layout(height=350)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No severity data available")
+            st.info("No attack data available")
     
     # Recent Attacks Table
     st.subheader("🕐 Recent Detections")
@@ -586,7 +930,9 @@ def show_dashboard():
                 'URL (Preview)': df['url'].str[:50] + '...',
                 'Attack Types': df['attack_types'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x),
                 'Severity': df['severity'],
-                'Confidence': df['confidence'].apply(lambda x: f"{x}%")
+                'Status': df['is_successful'].apply(lambda x: '✅ Success' if x else '🔄 Attempt'),
+                'Confidence': df['confidence'].apply(lambda x: f"{x}%"),
+                'Source IP': df.get('src_ip', 'N/A')
             })
             st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
@@ -601,7 +947,8 @@ def show_dashboard():
             patterns_info.append({
                 'Category': info['category'],
                 'Severity': info['severity'],
-                'Patterns Count': len(info['patterns'])
+                'Patterns Count': len(info['patterns']),
+                'Success Indicators': len(info.get('success_indicators', []))
             })
         
         patterns_df = pd.DataFrame(patterns_info)
@@ -616,12 +963,27 @@ def show_url_analysis():
         st.error("❌ MongoDB not configured. Please add MongoDB connection string to Streamlit secrets.")
         return
     
+    # Display current model info
+    current_model = GEMINI_MODELS[st.session_state.selected_model]
+    st.info(f"🤖 **Current Model**: {current_model['name']} | 📊 **Context**: {current_model['context_window']:,} tokens")
+    
     # Input
-    url_input = st.text_area(
-        "URL or HTTP Request",
-        placeholder="http://example.com/page?id=1' OR '1'='1\n\nExample attacks:\n- SQL: /page?id=1' UNION SELECT * FROM users--\n- XSS: /search?q=<script>alert(1)</script>\n- Path Traversal: /file?path=../../etc/passwd",
-        height=150
-    )
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        url_input = st.text_area(
+            "URL or HTTP Request",
+            placeholder="http://example.com/page?id=1' OR '1'='1\n\nExample attacks:\n- SQL: /page?id=1' UNION SELECT * FROM users--\n- XSS: /search?q=<script>alert(1)</script>\n- Path Traversal: /file?path=../../etc/passwd",
+            height=150
+        )
+    
+    with col2:
+        response_input = st.text_area(
+            "HTTP Response (Optional)",
+            placeholder="Paste HTTP response content to determine attack success...",
+            height=150,
+            help="Provide response content to analyze if the attack was successful"
+        )
     
     col1, col2 = st.columns([1, 4])
     with col1:
@@ -633,14 +995,26 @@ def show_url_analysis():
     
     if analyze_button and url_input:
         with st.spinner("🔄 Analyzing URL..."):
+            # Extract IP information
+            src_ip = extract_ip_from_url(url_input)
+            ip_info = get_ip_info(src_ip) if src_ip else {}
+            
             # Quick detection using MongoDB patterns
             quick_attacks, quick_indicators = quick_detection(url_input, st.session_state.attack_patterns_cache)
+            
+            # Determine success based on response content
+            is_successful = False
+            success_indicators = []
+            if response_input and quick_attacks:
+                is_successful, success_indicators = detect_attack_success(
+                    url_input, response_input, quick_attacks, st.session_state.attack_patterns_cache
+                )
             
             # Gemini analysis
             gemini_result = None
             if use_gemini and st.session_state.api_key:
-                with st.spinner("🤖 Running Gemini AI analysis..."):
-                    gemini_result = analyze_with_gemini(url_input, quick_attacks)
+                with st.spinner(f"🤖 Running {current_model['name']} analysis..."):
+                    gemini_result = analyze_with_gemini(url_input, quick_attacks, response_input)
             
             # Combine results
             if gemini_result:
@@ -650,6 +1024,10 @@ def show_url_analysis():
                 explanation = gemini_result.get('explanation', '')
                 recommendations = gemini_result.get('recommendations', [])
                 is_malicious = gemini_result.get('is_malicious', len(attack_types) > 0)
+                gemini_success = gemini_result.get('is_successful', is_successful)
+                
+                # Use Gemini's success determination if available, otherwise use pattern-based
+                final_success = gemini_success if 'is_successful' in gemini_result else is_successful
             else:
                 attack_types = quick_attacks
                 confidence = calculate_confidence(quick_indicators, None)
@@ -657,6 +1035,7 @@ def show_url_analysis():
                 explanation = "Pattern-based detection using MongoDB patterns"
                 recommendations = []
                 is_malicious = len(attack_types) > 0
+                final_success = is_successful
             
             # Get mitigation recommendations from MongoDB
             if is_malicious and attack_types:
@@ -674,9 +1053,15 @@ def show_url_analysis():
                 'confidence': confidence,
                 'severity': severity,
                 'is_malicious': is_malicious,
+                'is_successful': final_success,
                 'indicators': quick_indicators,
+                'success_indicators': success_indicators,
                 'explanation': explanation,
-                'recommendations': list(set(recommendations))  # Remove duplicates
+                'recommendations': list(set(recommendations)),  # Remove duplicates
+                'model_used': st.session_state.selected_model if use_gemini and st.session_state.api_key else "pattern_only",
+                'src_ip': src_ip,
+                'ip_info': ip_info,
+                'has_response': bool(response_input)
             }
             
             st.session_state.analysis_history.append(analysis_record)
@@ -684,7 +1069,7 @@ def show_url_analysis():
             if is_malicious:
                 st.session_state.attacks_db.append(analysis_record)
                 
-                # Save to MongoDB - FIXED: Check if mongo_db is not None
+                # Save to MongoDB
                 if st.session_state.mongo_db is not None:
                     save_detection_to_db(st.session_state.mongo_db, analysis_record.copy())
             
@@ -693,11 +1078,15 @@ def show_url_analysis():
             st.subheader("📊 Analysis Results")
             
             if is_malicious:
-                st.markdown(f'<div class="attack-card">', unsafe_allow_html=True)
-                st.error("⚠️ **THREAT DETECTED!**")
+                card_class = "success-attack" if final_success else "attempt-attack"
+                status_text = "SUCCESSFUL" if final_success else "ATTEMPTED"
+                status_icon = "✅" if final_success else "🔄"
+                
+                st.markdown(f'<div class="attack-card {card_class}">', unsafe_allow_html=True)
+                st.error(f"⚠️ **{status_icon} {status_text} ATTACK DETECTED!**")
                 st.markdown('</div>', unsafe_allow_html=True)
                 
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Confidence Score", f"{confidence}%")
                 with col2:
@@ -710,6 +1099,19 @@ def show_url_analysis():
                     st.metric("Severity", f"{severity_color} {severity}")
                 with col3:
                     st.metric("Attack Types", len(attack_types))
+                with col4:
+                    st.metric("Status", f"{status_icon} {status_text}")
+                
+                # IP Information
+                if src_ip:
+                    st.subheader("🌐 IP Information")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.info(f"**Source IP**: {src_ip}")
+                    with col2:
+                        st.info(f"**IP Version**: IPv{ip_info.get('version', 'N/A')}")
+                    with col3:
+                        st.info(f"**Type**: {'Private' if ip_info.get('is_private') else 'Public'}")
                 
                 # Attack Types
                 st.subheader("🎯 Detected Attack Types")
@@ -721,6 +1123,12 @@ def show_url_analysis():
                     st.subheader("🔍 Technical Indicators")
                     for indicator in quick_indicators:
                         st.markdown(f"- {indicator}")
+                
+                # Success Indicators
+                if final_success and success_indicators:
+                    st.subheader("✅ Success Indicators")
+                    for indicator in success_indicators:
+                        st.markdown(f"- 🎯 {indicator}")
                 
                 # Explanation
                 if explanation:
@@ -749,6 +1157,10 @@ def show_bulk_analysis():
         st.error("❌ MongoDB not configured. Please add MongoDB connection string to Streamlit secrets.")
         return
     
+    # Display current model info
+    current_model = GEMINI_MODELS[st.session_state.selected_model]
+    st.info(f"🤖 **Current Model**: {current_model['name']} | ⚡ **Rate Limit**: {current_model['rate_limit']} RPM")
+    
     # Show PCAP support status
     if PCAP_SUPPORT or DPKT_SUPPORT:
         pcap_libs = []
@@ -770,8 +1182,13 @@ def show_bulk_analysis():
     # Analysis options
     with st.expander("⚙️ Analysis Options", expanded=True):
         use_ai = st.checkbox("Enable Gemini AI Analysis", value=False, disabled=not st.session_state.api_key)
+        enhanced_pcap = st.checkbox("Enhanced PCAP Analysis", value=True, 
+                                   help="Extract full HTTP sessions with request/response pairs")
         if not st.session_state.api_key:
             st.info("💡 AI analysis disabled without API key in secrets (pattern-based detection will still work)")
+        
+        if use_ai and st.session_state.api_key:
+            st.warning(f"⚠️ Using {current_model['name']} with rate limit of {current_model['rate_limit']} RPM. Large files may take time.")
     
     if uploaded_file is not None:
         st.success(f"✅ File uploaded: {uploaded_file.name} ({uploaded_file.size / 1024:.2f} KB)")
@@ -779,13 +1196,18 @@ def show_bulk_analysis():
         if st.button("🚀 Start Analysis", type="primary"):
             with st.spinner("Processing file..."):
                 try:
+                    sessions = []
                     urls = []
                     
                     # Read file based on type
                     if uploaded_file.name.endswith(('.pcap', '.pcapng')):
                         if PCAP_SUPPORT or DPKT_SUPPORT:
-                            urls = parse_pcap_file(uploaded_file)
-                            if urls:
+                            if enhanced_pcap:
+                                sessions = parse_pcap_file_enhanced(uploaded_file)
+                                urls = [session['url'] for session in sessions if session.get('url')]
+                                st.info(f"📊 Extracted {len(sessions)} HTTP sessions from PCAP")
+                            else:
+                                urls = parse_pcap_file(uploaded_file)
                                 st.info(f"📊 Extracted {len(urls)} URLs from PCAP")
                         else:
                             st.error("PCAP parsing requires scapy or dpkt.")
@@ -795,111 +1217,190 @@ def show_bulk_analysis():
                         df = pd.read_csv(uploaded_file)
                         st.info(f"📊 Loaded {len(df)} rows from CSV")
                         
-                        if 'url' in df.columns:
-                            urls = df['url'].tolist()
+                        url_columns = [col for col in df.columns if 'url' in col.lower()]
+                        if url_columns:
+                            urls = df[url_columns[0]].dropna().tolist()
                         else:
-                            st.error("CSV must contain a 'url' column")
+                            st.error("CSV must contain a URL column")
                             return
                     
                     elif uploaded_file.name.endswith('.json'):
                         data = json.load(uploaded_file)
                         if isinstance(data, list):
-                            urls = [item.get('url', '') for item in data if isinstance(item, dict)]
+                            # Try to find URL fields
+                            urls = []
+                            for item in data:
+                                if isinstance(item, dict):
+                                    for key, value in item.items():
+                                        if 'url' in key.lower() and isinstance(value, str):
+                                            urls.append(value)
+                                            break
                         else:
                             urls = [data.get('url', '')] if isinstance(data, dict) else []
                         st.info(f"📊 Loaded {len(urls)} URLs from JSON")
                     
                     elif uploaded_file.name.endswith('.txt'):
                         content = uploaded_file.read().decode('utf-8')
-                        urls = [line.strip() for line in content.split('\n') if line.strip()]
+                        urls = [line.strip() for line in content.split('\n') if line.strip() and line.startswith('http')]
                         st.info(f"📊 Loaded {len(urls)} URLs from text file")
                     
-                    if not urls:
-                        st.warning("No URLs found in file")
+                    if not urls and not sessions:
+                        st.warning("No URLs or sessions found in file")
                         return
                     
-                    # Remove duplicates
-                    urls = list(set(urls))
-                    st.info(f"🔍 Analyzing {len(urls)} unique URLs...")
+                    # Remove duplicates if processing URLs directly
+                    if urls and not sessions:
+                        urls = list(set(urls))
+                    
+                    total_items = len(sessions) if sessions else len(urls)
+                    st.info(f"🔍 Analyzing {total_items} items...")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
                     results = []
-                    for idx, url in enumerate(urls):
-                        if url:
-                            status_text.text(f"Analyzing {idx + 1}/{len(urls)}: {url[:50]}...")
-                            
-                            quick_attacks, quick_indicators = quick_detection(url, st.session_state.attack_patterns_cache)
-                            
-                            if use_ai and st.session_state.api_key and quick_attacks:
-                                gemini_result = analyze_with_gemini(url, quick_attacks)
-                                if gemini_result:
-                                    attack_types = gemini_result.get('attack_types', quick_attacks)
-                                    confidence = gemini_result.get('confidence', 0)
-                                    severity = gemini_result.get('severity', determine_severity(attack_types))
-                                else:
-                                    attack_types = quick_attacks
-                                    confidence = calculate_confidence(quick_indicators, None)
-                                    severity = determine_severity(attack_types)
+                    items_to_process = sessions if sessions else urls
+                    
+                    for idx, item in enumerate(items_to_process):
+                        if sessions:
+                            # Process full session
+                            url = item['url']
+                            response_content = item.get('response_content')
+                            src_ip = item.get('src_ip')
+                            status_text.text(f"Analyzing {idx + 1}/{total_items}: {url[:50]}...")
+                        else:
+                            # Process URL only
+                            url = item
+                            response_content = None
+                            src_ip = extract_ip_from_url(url)
+                            status_text.text(f"Analyzing {idx + 1}/{total_items}: {url[:50]}...")
+                        
+                        # Extract IP information
+                        ip_info = get_ip_info(src_ip) if src_ip else {}
+                        
+                        quick_attacks, quick_indicators = quick_detection(url, st.session_state.attack_patterns_cache)
+                        
+                        # Determine success if response content is available
+                        is_successful = False
+                        success_indicators = []
+                        if response_content and quick_attacks:
+                            is_successful, success_indicators = detect_attack_success(
+                                url, response_content, quick_attacks, st.session_state.attack_patterns_cache
+                            )
+                        
+                        if use_ai and st.session_state.api_key and quick_attacks:
+                            gemini_result = analyze_with_gemini(url, quick_attacks, response_content)
+                            if gemini_result:
+                                attack_types = gemini_result.get('attack_types', quick_attacks)
+                                confidence = gemini_result.get('confidence', 0)
+                                severity = gemini_result.get('severity', determine_severity(attack_types))
+                                gemini_success = gemini_result.get('is_successful', is_successful)
+                                final_success = gemini_success if 'is_successful' in gemini_result else is_successful
                             else:
                                 attack_types = quick_attacks
                                 confidence = calculate_confidence(quick_indicators, None)
                                 severity = determine_severity(attack_types)
-                            
-                            if attack_types:
-                                result = {
-                                    'url': url,
-                                    'attack_types': attack_types,
-                                    'confidence': confidence,
-                                    'severity': severity,
-                                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                                results.append(result)
-                                st.session_state.attacks_db.append(result)
-                                
-                                # Save to MongoDB - FIXED: Check if mongo_db is not None
-                                if st.session_state.mongo_db is not None:
-                                    save_detection_to_db(st.session_state.mongo_db, result.copy())
+                                final_success = is_successful
+                        else:
+                            attack_types = quick_attacks
+                            confidence = calculate_confidence(quick_indicators, None)
+                            severity = determine_severity(attack_types)
+                            final_success = is_successful
                         
-                        progress_bar.progress((idx + 1) / len(urls))
+                        if attack_types:
+                            result = {
+                                'url': url,
+                                'attack_types': attack_types,
+                                'confidence': confidence,
+                                'severity': severity,
+                                'is_successful': final_success,
+                                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                'model_used': st.session_state.selected_model if use_ai and st.session_state.api_key else "pattern_only",
+                                'src_ip': src_ip,
+                                'ip_info': ip_info,
+                                'success_indicators': success_indicators,
+                                'response_available': bool(response_content)
+                            }
+                            
+                            if sessions:
+                                result.update({
+                                    'dst_ip': item.get('dst_ip'),
+                                    'method': item.get('method'),
+                                    'status_code': item.get('status_code'),
+                                    'stream_id': item.get('stream_id')
+                                })
+                            
+                            results.append(result)
+                            st.session_state.attacks_db.append(result)
+                            
+                            # Save to MongoDB
+                            if st.session_state.mongo_db is not None:
+                                save_detection_to_db(st.session_state.mongo_db, result.copy())
+                        
+                        progress_bar.progress((idx + 1) / total_items)
                     
                     status_text.text("✅ Analysis complete!")
                     
                     # Display results
                     if results:
-                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
+                        st.success(f"🎯 Found {len(results)} potential attacks out of {total_items} items")
                         
                         # Summary statistics
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Total Threats", len(results))
                         with col2:
+                            successful = len([r for r in results if r['is_successful']])
+                            st.metric("Successful", successful)
+                        with col3:
                             critical = len([r for r in results if r['severity'] == 'CRITICAL'])
                             st.metric("Critical", critical)
-                        with col3:
+                        with col4:
                             avg_conf = sum(r['confidence'] for r in results) / len(results)
                             st.metric("Avg Confidence", f"{avg_conf:.1f}%")
                         
                         # Results table
                         results_df = pd.DataFrame(results)
-                        results_df['attack_types'] = results_df['attack_types'].apply(lambda x: ', '.join(x))
+                        results_df['attack_types'] = results_df['attack_types'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x)
+                        results_df['status'] = results_df['is_successful'].apply(lambda x: '✅ Success' if x else '🔄 Attempt')
                         
                         display_df = results_df.copy()
+                        display_columns = ['timestamp', 'url', 'attack_types', 'severity', 'status', 'confidence']
+                        if 'src_ip' in results_df.columns:
+                            display_columns.append('src_ip')
+                        
+                        display_df = display_df[display_columns]
                         display_df['url'] = display_df['url'].str[:80] + '...'
+                        display_df['confidence'] = display_df['confidence'].apply(lambda x: f"{x}%")
+                        
                         st.dataframe(display_df, use_container_width=True)
                         
-                        # Download results
-                        csv = results_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Results (CSV)",
-                            data=csv,
-                            file_name=f"attack_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv"
-                        )
+                        # Export options
+                        st.subheader("📤 Export Results")
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            # CSV Export
+                            csv_data = export_to_csv(results_df, "attack_results.csv")
+                            st.download_button(
+                                label="📥 Download Results (CSV)",
+                                data=csv_data,
+                                file_name=f"attack_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                        
+                        with col2:
+                            # JSON Export
+                            json_data = export_to_json(results_df, "attack_results.json")
+                            st.download_button(
+                                label="📥 Download Results (JSON)",
+                                data=json_data,
+                                file_name=f"attack_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json"
+                            )
                     else:
-                        st.success("✅ No attacks detected. All URLs appear safe!")
+                        st.success("✅ No attacks detected. All items appear safe!")
                 
                 except Exception as e:
                     st.error(f"Error processing file: {str(e)}")
@@ -909,7 +1410,7 @@ def show_bulk_analysis():
 def show_attack_database():
     """Attack Database page"""
     st.title("🗂️ Attack Database")
-    st.markdown("Query and filter detected attacks")
+    st.markdown("Query and filter detected attacks with advanced filtering options")
     
     # Option to load from MongoDB or session
     col1, col2 = st.columns([3, 1])
@@ -920,9 +1421,9 @@ def show_attack_database():
             st.rerun()
     
     # Load data based on source
-    if data_source == "MongoDB History" and st.session_state.mongo_db is not None:  # FIXED: Check if not None
+    if data_source == "MongoDB History" and st.session_state.mongo_db is not None:
         with st.spinner("Loading from MongoDB..."):
-            attacks_data = get_detection_history_from_db(st.session_state.mongo_db, limit=500)
+            attacks_data = get_detection_history_from_db(st.session_state.mongo_db, limit=1000)
             if not attacks_data:
                 st.info("No attacks in MongoDB database yet.")
                 return
@@ -932,11 +1433,12 @@ def show_attack_database():
             st.info("No attacks in session database yet. Analyze some URLs to populate.")
             return
     
-    # Filters
-    with st.expander("🔍 Filters", expanded=True):
-        col1, col2, col3 = st.columns(3)
+    # Advanced Filters
+    with st.expander("🔍 Advanced Filters", expanded=True):
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
+            # Attack Type Filter
             all_attack_types = set()
             for attack in attacks_data:
                 all_attack_types.update(attack.get('attack_types', []))
@@ -944,10 +1446,26 @@ def show_attack_database():
             selected_types = st.multiselect("Attack Type", sorted(list(all_attack_types)))
         
         with col2:
+            # Severity Filter
             selected_severity = st.multiselect("Severity", ["CRITICAL", "HIGH", "MEDIUM", "LOW"])
         
         with col3:
+            # Status Filter
+            status_options = ["All", "Successful", "Attempted"]
+            selected_status = st.selectbox("Attack Status", status_options)
+        
+        with col4:
+            # Confidence Filter
             min_confidence = st.slider("Minimum Confidence", 0, 100, 0)
+        
+        # IP Range Filter
+        col1, col2 = st.columns(2)
+        with col1:
+            ip_filter = st.text_input("IP Address/Range Filter", 
+                                    placeholder="192.168.1.1 or 192.168.1.0/24 or 192.168.1.1-192.168.1.100")
+        
+        with col2:
+            ip_filter_type = st.selectbox("IP Filter Type", ["Source IP", "Destination IP", "Any IP"])
     
     # Apply filters
     filtered_attacks = attacks_data.copy()
@@ -958,8 +1476,29 @@ def show_attack_database():
     if selected_severity:
         filtered_attacks = [a for a in filtered_attacks if a.get('severity') in selected_severity]
     
+    if selected_status != "All":
+        target_status = selected_status == "Successful"
+        filtered_attacks = [a for a in filtered_attacks if a.get('is_successful') == target_status]
+    
     if min_confidence > 0:
         filtered_attacks = [a for a in filtered_attacks if a.get('confidence', 0) >= min_confidence]
+    
+    # IP Filtering
+    if ip_filter:
+        ip_filtered = []
+        for attack in filtered_attacks:
+            if ip_filter_type == "Source IP" and attack.get('src_ip'):
+                if is_ip_in_range(attack['src_ip'], ip_filter):
+                    ip_filtered.append(attack)
+            elif ip_filter_type == "Destination IP" and attack.get('dst_ip'):
+                if is_ip_in_range(attack['dst_ip'], ip_filter):
+                    ip_filtered.append(attack)
+            elif ip_filter_type == "Any IP":
+                src_match = attack.get('src_ip') and is_ip_in_range(attack['src_ip'], ip_filter)
+                dst_match = attack.get('dst_ip') and is_ip_in_range(attack['dst_ip'], ip_filter)
+                if src_match or dst_match:
+                    ip_filtered.append(attack)
+        filtered_attacks = ip_filtered
     
     st.markdown(f"### 📊 Showing {len(filtered_attacks)} of {len(attacks_data)} attacks")
     
@@ -972,9 +1511,17 @@ def show_attack_database():
             df = df.drop('_id', axis=1)
         
         df['attack_types'] = df['attack_types'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x)
+        df['status'] = df['is_successful'].apply(lambda x: '✅ Success' if x else '🔄 Attempt')
         
         # Select columns to display
-        display_columns = ['timestamp', 'url', 'attack_types', 'severity', 'confidence']
+        display_columns = ['timestamp', 'url', 'attack_types', 'severity', 'status', 'confidence']
+        if 'src_ip' in df.columns:
+            display_columns.append('src_ip')
+        if 'dst_ip' in df.columns:
+            display_columns.append('dst_ip')
+        if 'model_used' in df.columns:
+            display_columns.append('model_used')
+        
         available_columns = [col for col in display_columns if col in df.columns]
         
         display_df = df[available_columns].copy()
@@ -984,13 +1531,26 @@ def show_attack_database():
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         
         # Export filtered results
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Export Filtered Results (CSV)",
-            data=csv,
-            file_name=f"filtered_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
+        st.subheader("📤 Export Filtered Results")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            csv_data = export_to_csv(df, "filtered_attacks.csv")
+            st.download_button(
+                label="📥 Export as CSV",
+                data=csv_data,
+                file_name=f"filtered_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        
+        with col2:
+            json_data = export_to_json(df, "filtered_attacks.json")
+            st.download_button(
+                label="📥 Export as JSON",
+                data=json_data,
+                file_name=f"filtered_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
     else:
         st.info("No attacks match the selected filters.")
 
@@ -1004,17 +1564,32 @@ def show_visualizations():
     
     df = pd.DataFrame(st.session_state.attacks_db)
     
+    # Main metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        total_attacks = len(df)
+        st.metric("Total Attacks", total_attacks)
+    with col2:
+        successful_attacks = len(df[df['is_successful'] == True])
+        st.metric("Successful Attacks", successful_attacks)
+    with col3:
+        attempted_attacks = total_attacks - successful_attacks
+        st.metric("Attempted Attacks", attempted_attacks)
+    with col4:
+        critical_attacks = len(df[df['severity'] == 'CRITICAL'])
+        st.metric("Critical Attacks", critical_attacks)
+    
     # Timeline
     st.subheader("📈 Attack Timeline")
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     timeline_df = df.groupby(df['timestamp'].dt.date).size().reset_index(name='count')
     timeline_df.columns = ['Date', 'Attacks']
     
-    fig = px.line(timeline_df, x='Date', y='Attacks', markers=True)
+    fig = px.line(timeline_df, x='Date', y='Attacks', markers=True, title="Attack Timeline")
     fig.update_layout(height=400)
     st.plotly_chart(fig, use_container_width=True)
     
-    # Attack type distribution
+    # Attack analysis
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1047,12 +1622,62 @@ def show_visualizations():
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
     
-    # Confidence distribution
-    st.subheader("📊 Confidence Score Distribution")
-    fig = px.histogram(df, x='confidence', nbins=20, 
-                       labels={'confidence': 'Confidence Score', 'count': 'Number of Attacks'})
-    fig.update_layout(height=350)
-    st.plotly_chart(fig, use_container_width=True)
+    # Success analysis
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("✅ Success vs Attempt Distribution")
+        success_data = df['is_successful'].value_counts()
+        success_labels = {True: 'Successful', False: 'Attempted'}
+        success_data.index = [success_labels[x] for x in success_data.index]
+        
+        colors = ['#FF4444', '#FFA500']
+        fig = px.pie(values=success_data.values, names=success_data.index, 
+                     color=success_data.index, color_discrete_map={'Successful': '#FF4444', 'Attempted': '#FFA500'})
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("📊 Confidence Score Distribution")
+        fig = px.histogram(df, x='confidence', nbins=20, 
+                           labels={'confidence': 'Confidence Score', 'count': 'Number of Attacks'})
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # IP Analysis (if available)
+    if 'src_ip' in df.columns and df['src_ip'].notna().any():
+        st.subheader("🌐 Source IP Analysis")
+        ip_counts = df['src_ip'].value_counts().head(10)
+        ip_df = pd.DataFrame({'IP Address': ip_counts.index, 'Attack Count': ip_counts.values})
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig = px.bar(ip_df, x='Attack Count', y='IP Address', orientation='h',
+                         title="Top 10 Attacking IPs")
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # IP Type Analysis
+            private_ips = len(df[df['src_ip'].apply(lambda x: x and ipaddress.ip_address(x).is_private)])
+            public_ips = len(df) - private_ips
+            ip_type_data = {'Type': ['Private IPs', 'Public IPs'], 'Count': [private_ips, public_ips]}
+            ip_type_df = pd.DataFrame(ip_type_data)
+            
+            fig = px.pie(ip_type_df, values='Count', names='Type', 
+                         title="Private vs Public IP Attacks")
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Model usage distribution (if available)
+    if 'model_used' in df.columns:
+        st.subheader("🤖 Model Usage Distribution")
+        model_counts = df['model_used'].value_counts()
+        fig = px.pie(values=model_counts.values, names=model_counts.index, 
+                     title="Analysis Methods Used")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
     
     # Top attacked patterns
     st.subheader("🔝 Most Common Attack Patterns")
@@ -1078,6 +1703,7 @@ def show_visualizations():
                 'Attack Type': category,
                 'Status': '✅ Detected' if detected else '⚪ Not Detected',
                 'Pattern Count': len(info['patterns']),
+                'Success Indicators': len(info.get('success_indicators', [])),
                 'Severity': info['severity']
             })
         
