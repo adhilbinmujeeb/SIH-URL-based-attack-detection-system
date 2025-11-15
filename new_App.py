@@ -459,7 +459,7 @@ def main():
         if st.button("Connect to MongoDB", type="primary"):
             with st.spinner("Connecting to MongoDB..."):
                 client, db = connect_to_mongodb(mongodb_string)
-                if client and db:
+                if client is not None and db is not None:
                     st.session_state.mongodb_client = client
                     st.session_state.mongodb_db = db
                     st.session_state.mongodb_connected = True
@@ -505,7 +505,7 @@ def main():
         st.markdown("---")
         
         # Stats
-        if st.session_state.attacks_db:
+        if len(st.session_state.attacks_db) > 0:
             st.metric("Total Attacks Detected", len(st.session_state.attacks_db))
             critical_count = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
             st.metric("Critical Threats", critical_count)
@@ -571,19 +571,19 @@ def show_dashboard():
         st.write(f"🤖 Gemini AI: {'Enabled' if st.session_state.api_key else 'Disabled'}")
         
         # Pattern categories
-        if st.session_state.attack_patterns:
+        if len(st.session_state.attack_patterns) > 0:
             st.write("**Loaded Categories:**")
             for pattern_id, pattern_data in list(st.session_state.attack_patterns.items())[:5]:
                 st.write(f"  • {pattern_data['category']} ({pattern_data['severity']})")
     
     with col2:
         st.subheader("📈 Attack Distribution")
-        if st.session_state.attacks_db:
+        if len(st.session_state.attacks_db) > 0:
             attack_types = []
             for attack in st.session_state.attacks_db:
                 attack_types.extend(attack.get('attack_types', []))
             
-            if attack_types:
+            if len(attack_types) > 0:
                 type_counts = Counter(attack_types)
                 df = pd.DataFrame(list(type_counts.items()), columns=['Attack Type', 'Count'])
                 fig = px.pie(df, values='Count', names='Attack Type', hole=0.4)
@@ -596,7 +596,7 @@ def show_dashboard():
     
     # Recent Detections
     st.subheader("🕐 Recent Detections")
-    if st.session_state.attacks_db:
+    if len(st.session_state.attacks_db) > 0:
         recent = st.session_state.attacks_db[-10:][::-1]
         
         df = pd.DataFrame(recent)
@@ -689,7 +689,7 @@ def show_url_analysis():
                 st.session_state.attacks_db.append(analysis_record)
                 
                 # Save to MongoDB
-                if st.session_state.mongodb_db:
+                if st.session_state.mongodb_db is not None:
                     save_detection_to_mongodb(st.session_state.mongodb_db, analysis_record)
             
             # Display Results
@@ -878,7 +878,7 @@ def show_bulk_analysis():
                                 st.session_state.attacks_db.append(result)
                                 
                                 # Save to MongoDB
-                                if save_to_db and st.session_state.mongodb_db:
+                                if save_to_db and st.session_state.mongodb_db is not None:
                                     save_detection_to_mongodb(st.session_state.mongodb_db, result)
                         
                         progress_bar.progress((idx + 1) / len(urls))
@@ -932,7 +932,7 @@ def show_attack_database():
     st.title("🗂️ Attack Database")
     st.markdown("Query and filter detected attacks")
     
-    if not st.session_state.attacks_db:
+    if len(st.session_state.attacks_db) == 0:
         st.info("No attacks in database yet. Analyze some URLs to populate the database.")
         return
     
@@ -994,7 +994,7 @@ def show_visualizations():
     """Visualizations page"""
     st.title("📊 Advanced Analytics & Visualizations")
     
-    if not st.session_state.attacks_db:
+    if len(st.session_state.attacks_db) == 0:
         st.info("No data available for visualization. Analyze some URLs first.")
         return
     
@@ -1020,28 +1020,34 @@ def show_visualizations():
             if isinstance(attacks, list):
                 attack_types.extend(attacks)
         
-        type_counts = Counter(attack_types)
-        type_df = pd.DataFrame(list(type_counts.items()), columns=['Attack Type', 'Count'])
-        type_df = type_df.sort_values('Count', ascending=False)
-        
-        fig = px.bar(type_df, x='Count', y='Attack Type', orientation='h',
-                     color='Count', color_continuous_scale='Reds')
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        if len(attack_types) > 0:
+            type_counts = Counter(attack_types)
+            type_df = pd.DataFrame(list(type_counts.items()), columns=['Attack Type', 'Count'])
+            type_df = type_df.sort_values('Count', ascending=False)
+            
+            fig = px.bar(type_df, x='Count', y='Attack Type', orientation='h',
+                         color='Count', color_continuous_scale='Reds')
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No attack type data available")
     
     with col2:
         st.subheader("⚠️ Severity Distribution")
         severity_counts = df['severity'].value_counts()
         
-        colors = {'CRITICAL': '#FF4444', 'HIGH': '#FF8844', 'MEDIUM': '#FFBB44', 'LOW': '#44FF44'}
-        fig = go.Figure(data=[go.Pie(
-            labels=severity_counts.index,
-            values=severity_counts.values,
-            marker=dict(colors=[colors.get(s, '#CCCCCC') for s in severity_counts.index]),
-            hole=0.4
-        )])
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        if len(severity_counts) > 0:
+            colors = {'CRITICAL': '#FF4444', 'HIGH': '#FF8844', 'MEDIUM': '#FFBB44', 'LOW': '#44FF44'}
+            fig = go.Figure(data=[go.Pie(
+                labels=severity_counts.index,
+                values=severity_counts.values,
+                marker=dict(colors=[colors.get(s, '#CCCCCC') for s in severity_counts.index]),
+                hole=0.4
+            )])
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No severity data available")
     
     # Confidence distribution
     st.subheader("📊 Confidence Score Distribution")
@@ -1055,8 +1061,19 @@ def show_pattern_management():
     st.title("⚙️ Attack Pattern Management")
     st.markdown("View and manage MongoDB attack patterns")
     
-    if not st.session_state.attack_patterns:
+    if len(st.session_state.attack_patterns) == 0:
         st.warning("No attack patterns loaded from MongoDB")
+        if st.button("🔄 Try Loading Patterns"):
+            if st.session_state.mongodb_db is not None:
+                patterns = load_attack_patterns(st.session_state.mongodb_db)
+                st.session_state.attack_patterns = patterns
+                if len(patterns) > 0:
+                    st.success(f"✅ Loaded {len(patterns)} attack categories")
+                    st.rerun()
+                else:
+                    st.error("No patterns found in MongoDB")
+            else:
+                st.error("MongoDB not connected")
         return
     
     # Statistics
@@ -1112,7 +1129,7 @@ def show_export():
     """Export & Reports page"""
     st.title("📥 Export & Report Generation")
     
-    if not st.session_state.attacks_db:
+    if len(st.session_state.attacks_db) == 0:
         st.info("No data available for export. Analyze some URLs first.")
         return
     
