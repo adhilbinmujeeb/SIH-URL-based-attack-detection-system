@@ -11,6 +11,20 @@ import time
 import io
 import base64
 
+# Try to import PCAP libraries
+try:
+    from scapy.all import rdpcap, TCP, Raw
+    from scapy.layers.http import HTTPRequest
+    PCAP_SUPPORT = True
+except ImportError:
+    PCAP_SUPPORT = False
+
+try:
+    import dpkt
+    DPKT_SUPPORT = True
+except ImportError:
+    DPKT_SUPPORT = False
+
 # Page configuration
 st.set_page_config(
     page_title="Cyber Attack Detection System",
@@ -314,6 +328,147 @@ def determine_severity(attack_types):
     
     return "LOW"
 
+def parse_pcap_with_scapy(pcap_file):
+    """Parse PCAP file using Scapy"""
+    urls = []
+    try:
+        packets = rdpcap(pcap_file)
+        
+        for packet in packets:
+            if packet.haslayer(HTTPRequest):
+                http_layer = packet[HTTPRequest]
+                
+                # Extract host and path
+                host = http_layer.Host.decode() if http_layer.Host else ""
+                path = http_layer.Path.decode() if http_layer.Path else ""
+                
+                if host and path:
+                    url = f"http://{host}{path}"
+                    urls.append(url)
+            
+            # Also check for raw HTTP requests in TCP payload
+            elif packet.haslayer(TCP) and packet.haslayer(Raw):
+                payload = packet[Raw].load
+                try:
+                    payload_str = payload.decode('utf-8', errors='ignore')
+                    
+                    # Look for HTTP requests
+                    if payload_str.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                        lines = payload_str.split('\r\n')
+                        if lines:
+                            request_line = lines[0]
+                            parts = request_line.split()
+                            if len(parts) >= 2:
+                                path = parts[1]
+                                
+                                # Find Host header
+                                host = ""
+                                for line in lines[1:]:
+                                    if line.lower().startswith('host:'):
+                                        host = line.split(':', 1)[1].strip()
+                                        break
+                                
+                                if host and path:
+                                    url = f"http://{host}{path}"
+                                    urls.append(url)
+                except:
+                    continue
+        
+        return urls
+    except Exception as e:
+        st.error(f"Error parsing PCAP with Scapy: {str(e)}")
+        return []
+
+def parse_pcap_with_dpkt(pcap_file):
+    """Parse PCAP file using dpkt"""
+    urls = []
+    try:
+        pcap_file.seek(0)
+        pcap = dpkt.pcap.Reader(pcap_file)
+        
+        for timestamp, buf in pcap:
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                
+                if not isinstance(eth.data, dpkt.ip.IP):
+                    continue
+                
+                ip = eth.data
+                
+                if not isinstance(ip.data, dpkt.tcp.TCP):
+                    continue
+                
+                tcp = ip.data
+                
+                if len(tcp.data) > 0:
+                    try:
+                        # Try to parse as HTTP
+                        request = dpkt.http.Request(tcp.data)
+                        
+                        # Extract URL components
+                        host = request.headers.get('host', '')
+                        uri = request.uri
+                        
+                        if host and uri:
+                            url = f"http://{host}{uri}"
+                            urls.append(url)
+                    except:
+                        # Try manual parsing
+                        payload = tcp.data.decode('utf-8', errors='ignore')
+                        if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                            lines = payload.split('\r\n')
+                            if lines:
+                                request_line = lines[0]
+                                parts = request_line.split()
+                                if len(parts) >= 2:
+                                    path = parts[1]
+                                    
+                                    # Find Host header
+                                    host = ""
+                                    for line in lines[1:]:
+                                        if line.lower().startswith('host:'):
+                                            host = line.split(':', 1)[1].strip()
+                                            break
+                                    
+                                    if host and path:
+                                        url = f"http://{host}{path}"
+                                        urls.append(url)
+            except:
+                continue
+        
+        return urls
+    except Exception as e:
+        st.error(f"Error parsing PCAP with dpkt: {str(e)}")
+        return []
+
+def parse_pcap_file(uploaded_file):
+    """Parse PCAP file and extract URLs"""
+    urls = []
+    
+    # Try Scapy first
+    if PCAP_SUPPORT:
+        with st.spinner("Parsing PCAP with Scapy..."):
+            # Save to temporary file
+            temp_path = f"/tmp/{uploaded_file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getvalue())
+            
+            urls = parse_pcap_with_scapy(temp_path)
+    
+    # Fallback to dpkt
+    if not urls and DPKT_SUPPORT:
+        with st.spinner("Parsing PCAP with dpkt..."):
+            uploaded_file.seek(0)
+            urls = parse_pcap_with_dpkt(uploaded_file)
+    
+    if not urls:
+        if not PCAP_SUPPORT and not DPKT_SUPPORT:
+            st.error("PCAP parsing requires scapy or dpkt libraries. Please install them or use CSV/JSON/TXT format.")
+        else:
+            st.warning("No HTTP URLs found in PCAP file. The file may not contain HTTP traffic or may be encrypted (HTTPS).")
+    
+    return urls
+
 # Main Application
 def main():
     # Sidebar
@@ -574,13 +729,24 @@ def show_url_analysis():
 def show_bulk_analysis():
     """Bulk Analysis page"""
     st.title("📂 Bulk Traffic Analysis")
-    st.markdown("Upload PCAP, CSV, or JSON files for batch analysis")
+    st.markdown("Upload PCAP, CSV, JSON, or TXT files for batch analysis")
+    
+    # Show PCAP support status
+    if PCAP_SUPPORT or DPKT_SUPPORT:
+        pcap_libs = []
+        if PCAP_SUPPORT:
+            pcap_libs.append("Scapy")
+        if DPKT_SUPPORT:
+            pcap_libs.append("dpkt")
+        st.success(f"✅ PCAP support enabled ({', '.join(pcap_libs)})")
+    else:
+        st.warning("⚠️ PCAP support disabled. Install scapy or dpkt for PCAP analysis.")
     
     # File upload
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=['pcap', 'pcapng', 'csv', 'json', 'txt'],
-        help="Supported formats: PCAP, CSV, JSON, TXT"
+        help="Supported formats: PCAP, PCAPNG, CSV, JSON, TXT"
     )
     
     # Analysis options
@@ -598,13 +764,24 @@ def show_bulk_analysis():
             )
     
     if uploaded_file is not None:
-        st.success(f"✅ File uploaded: {uploaded_file.name}")
+        st.success(f"✅ File uploaded: {uploaded_file.name} ({uploaded_file.size / 1024:.2f} KB)")
         
         if st.button("🚀 Start Analysis", type="primary"):
             with st.spinner("Processing file..."):
                 try:
+                    urls = []
+                    
                     # Read file based on type
-                    if uploaded_file.name.endswith('.csv'):
+                    if uploaded_file.name.endswith(('.pcap', '.pcapng')):
+                        if PCAP_SUPPORT or DPKT_SUPPORT:
+                            urls = parse_pcap_file(uploaded_file)
+                            if urls:
+                                st.info(f"📊 Extracted {len(urls)} URLs from PCAP")
+                        else:
+                            st.error("PCAP parsing requires scapy or dpkt. Please install them or use CSV/JSON/TXT format.")
+                            return
+                    
+                    elif uploaded_file.name.endswith('.csv'):
                         df = pd.read_csv(uploaded_file)
                         st.info(f"📊 Loaded {len(df)} rows from CSV")
                         
@@ -618,9 +795,9 @@ def show_bulk_analysis():
                     elif uploaded_file.name.endswith('.json'):
                         data = json.load(uploaded_file)
                         if isinstance(data, list):
-                            urls = [item.get('url', '') for item in data]
+                            urls = [item.get('url', '') for item in data if isinstance(item, dict)]
                         else:
-                            urls = [data.get('url', '')]
+                            urls = [data.get('url', '')] if isinstance(data, dict) else []
                         st.info(f"📊 Loaded {len(urls)} URLs from JSON")
                     
                     elif uploaded_file.name.endswith('.txt'):
@@ -628,14 +805,17 @@ def show_bulk_analysis():
                         urls = [line.strip() for line in content.split('\n') if line.strip()]
                         st.info(f"📊 Loaded {len(urls)} URLs from text file")
                     
-                    else:
-                        st.error("PCAP parsing requires additional libraries (scapy/dpkt). Please use CSV, JSON, or TXT format.")
+                    if not urls:
+                        st.warning("No URLs found in file")
                         return
+                    
+                    # Remove duplicates
+                    urls = list(set(urls))
+                    st.info(f"🔍 Analyzing {len(urls)} unique URLs...")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    results_container = st.empty()
                     
                     results = []
                     for idx, url in enumerate(urls):
@@ -675,12 +855,27 @@ def show_bulk_analysis():
                     status_text.text("✅ Analysis complete!")
                     
                     # Display results
-                    st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
-                    
                     if results:
+                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
+                        
+                        # Summary statistics
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Total Threats", len(results))
+                        with col2:
+                            critical = len([r for r in results if r['severity'] == 'CRITICAL'])
+                            st.metric("Critical", critical)
+                        with col3:
+                            avg_conf = sum(r['confidence'] for r in results) / len(results)
+                            st.metric("Avg Confidence", f"{avg_conf:.1f}%")
+                        
+                        # Results table
                         results_df = pd.DataFrame(results)
                         results_df['attack_types'] = results_df['attack_types'].apply(lambda x: ', '.join(x))
-                        st.dataframe(results_df, use_container_width=True)
+                        
+                        display_df = results_df.copy()
+                        display_df['url'] = display_df['url'].str[:80] + '...'
+                        st.dataframe(display_df, use_container_width=True)
                         
                         # Download results
                         csv = results_df.to_csv(index=False)
@@ -690,9 +885,13 @@ def show_bulk_analysis():
                             file_name=f"attack_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                             mime="text/csv"
                         )
+                    else:
+                        st.success("✅ No attacks detected. All URLs appear safe!")
                 
                 except Exception as e:
                     st.error(f"Error processing file: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 def show_attack_database():
     """Attack Database page"""
