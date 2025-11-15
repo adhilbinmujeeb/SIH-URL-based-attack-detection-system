@@ -76,13 +76,14 @@ if 'attack_patterns_cache' not in st.session_state:
     st.session_state.attack_patterns_cache = None
 if 'patterns_loaded' not in st.session_state:
     st.session_state.patterns_loaded = False
+if 'secrets_configured' not in st.session_state:
+    st.session_state.secrets_configured = False
 
 # MongoDB Functions
 @st.cache_resource
 def connect_to_mongodb(connection_string):
     """Connect to MongoDB Atlas"""
     try:
-        connection_string="mongodb+srv://adhilbinmujeeb:NVYM5d67PHpkE7LA@cluster0.uz62z.mongodb.net/"
         client = MongoClient(connection_string, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
         db = client['cyber_attack_detection']
@@ -147,6 +148,41 @@ def configure_gemini(api_key):
         st.error(f"Error configuring Gemini API: {str(e)}")
         return False
 
+# Initialize from secrets
+def initialize_from_secrets():
+    """Initialize MongoDB and Gemini from Streamlit secrets"""
+    try:
+        # Initialize MongoDB
+        if 'mongodb_connection' in st.secrets:
+            st.session_state.mongodb_connection = st.secrets.mongodb_connection
+            with st.spinner("🔗 Connecting to MongoDB..."):
+                db = connect_to_mongodb(st.session_state.mongodb_connection)
+                if db is not None:
+                    st.session_state.mongo_db = db
+                    patterns = load_attack_patterns_from_db(db)
+                    if patterns:
+                        st.session_state.attack_patterns_cache = patterns
+                        st.session_state.patterns_loaded = True
+                        st.success(f"✅ Loaded {len(patterns)} attack patterns from MongoDB!")
+                    else:
+                        st.error("❌ Failed to load attack patterns from MongoDB")
+                else:
+                    st.error("❌ Failed to connect to MongoDB")
+        
+        # Initialize Gemini API
+        if 'gemini_api_key' in st.secrets:
+            st.session_state.api_key = st.secrets.gemini_api_key
+            if st.session_state.api_key:
+                if configure_gemini(st.session_state.api_key):
+                    st.success("✅ Gemini API configured from secrets!")
+                else:
+                    st.error("❌ Failed to configure Gemini API")
+        
+        st.session_state.secrets_configured = True
+        
+    except Exception as e:
+        st.error(f"Error initializing from secrets: {str(e)}")
+
 # Attack Detection Functions using MongoDB patterns
 def detect_attack_with_patterns(url, attack_id, patterns_data):
     """Generic attack detection using MongoDB patterns"""
@@ -172,7 +208,7 @@ def detect_attack_with_patterns(url, attack_id, patterns_data):
 def quick_detection(url, patterns_data):
     """Quick pattern-based detection using MongoDB patterns"""
     if not patterns_data:
-        st.warning("⚠️ Attack patterns not loaded. Please configure MongoDB connection.")
+        st.warning("⚠️ Attack patterns not loaded. Please check MongoDB connection in secrets.")
         return [], []
     
     results = {}
@@ -385,45 +421,31 @@ def parse_pcap_file(uploaded_file):
 
 # Main Application
 def main():
+    # Initialize from secrets on first run
+    if not st.session_state.secrets_configured:
+        initialize_from_secrets()
+    
     # Sidebar
     with st.sidebar:
         st.image("https://img.icons8.com/clouds/200/security-checked.png", width=150)
         st.title("🛡️ Cyber Attack Detector")
         st.markdown("---")
         
-        # MongoDB Connection
-        st.subheader("🗄️ MongoDB Configuration")
-        mongodb_conn = st.text_input(
-            "MongoDB Connection String", 
-            type="password", 
-            value=st.session_state.mongodb_connection,
-            placeholder="mongodb+srv://..."
-        )
+        # Configuration Status
+        st.subheader("⚙️ Configuration Status")
         
-        if mongodb_conn != st.session_state.mongodb_connection:
-            st.session_state.mongodb_connection = mongodb_conn
-            st.session_state.patterns_loaded = False
-            
-            if mongodb_conn:
-                with st.spinner("Connecting to MongoDB..."):
-                    db = connect_to_mongodb(mongodb_conn)
-                    if db is not None:
-                        st.session_state.mongo_db = db
-                        patterns = load_attack_patterns_from_db(db)
-                        if patterns:
-                            st.session_state.attack_patterns_cache = patterns
-                            st.session_state.patterns_loaded = True
-                            st.success(f"✅ Loaded {len(patterns)} attack patterns!")
+        if st.session_state.patterns_loaded:
+            st.success("✅ MongoDB Connected")
+            st.info(f"📊 {len(st.session_state.attack_patterns_cache)} attack patterns loaded")
+        else:
+            st.error("❌ MongoDB Not Configured")
+            st.info("💡 Add MongoDB connection string to Streamlit secrets")
         
-        # API Key Input
-        st.markdown("---")
-        st.subheader("🔑 Gemini API Key")
-        api_key = st.text_input("API Key", type="password", value=st.session_state.api_key)
-        if api_key != st.session_state.api_key:
-            st.session_state.api_key = api_key
-            if api_key:
-                if configure_gemini(api_key):
-                    st.success("✅ Gemini API configured!")
+        if st.session_state.api_key:
+            st.success("✅ Gemini API Configured")
+        else:
+            st.warning("⚠️ Gemini API Not Configured")
+            st.info("💡 Add Gemini API key to Streamlit secrets")
         
         st.markdown("---")
         
@@ -437,12 +459,6 @@ def main():
         ])
         
         st.markdown("---")
-        
-        # Connection Status
-        if st.session_state.patterns_loaded:
-            st.success("✅ MongoDB Connected")
-        else:
-            st.warning("⚠️ Configure MongoDB")
         
         # Stats
         if st.session_state.attacks_db:
@@ -469,7 +485,18 @@ def show_dashboard():
     
     # Check MongoDB connection
     if not st.session_state.patterns_loaded:
-        st.warning("⚠️ Please configure MongoDB connection in the sidebar to load attack patterns.")
+        st.error("❌ MongoDB not configured. Please add MongoDB connection string to Streamlit secrets.")
+        st.info("""
+        **To configure Streamlit secrets:**
+        
+        1. Create a `.streamlit/secrets.toml` file in your project directory
+        2. Add the following configuration:
+        ```
+        mongodb_connection = "your_mongodb_connection_string"
+        gemini_api_key = "your_gemini_api_key"
+        ```
+        3. Restart the application
+        """)
         return
     
     # Stats Cards
@@ -572,7 +599,7 @@ def show_url_analysis():
     st.markdown("Enter a URL or HTTP request to analyze for potential cyber attacks")
     
     if not st.session_state.patterns_loaded:
-        st.warning("⚠️ Please configure MongoDB connection in the sidebar to load attack patterns.")
+        st.error("❌ MongoDB not configured. Please add MongoDB connection string to Streamlit secrets.")
         return
     
     # Input
@@ -588,7 +615,7 @@ def show_url_analysis():
     with col2:
         use_gemini = st.checkbox("Use Gemini AI for deep analysis", value=True, disabled=not st.session_state.api_key)
         if not st.session_state.api_key:
-            st.info("💡 Configure Gemini API key for AI-powered analysis")
+            st.info("💡 Configure Gemini API key in Streamlit secrets for AI-powered analysis")
     
     if analyze_button and url_input:
         with st.spinner("🔄 Analyzing URL..."):
@@ -705,7 +732,7 @@ def show_bulk_analysis():
     st.markdown("Upload PCAP, CSV, JSON, or TXT files for batch analysis")
     
     if not st.session_state.patterns_loaded:
-        st.warning("⚠️ Please configure MongoDB connection in the sidebar.")
+        st.error("❌ MongoDB not configured. Please add MongoDB connection string to Streamlit secrets.")
         return
     
     # Show PCAP support status
@@ -730,7 +757,7 @@ def show_bulk_analysis():
     with st.expander("⚙️ Analysis Options", expanded=True):
         use_ai = st.checkbox("Enable Gemini AI Analysis", value=False, disabled=not st.session_state.api_key)
         if not st.session_state.api_key:
-            st.info("💡 AI analysis disabled without API key (pattern-based detection will still work)")
+            st.info("💡 AI analysis disabled without API key in secrets (pattern-based detection will still work)")
     
     if uploaded_file is not None:
         st.success(f"✅ File uploaded: {uploaded_file.name} ({uploaded_file.size / 1024:.2f} KB)")
