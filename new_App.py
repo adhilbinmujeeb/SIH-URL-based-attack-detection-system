@@ -230,7 +230,8 @@ def analyze_with_gemini(url, quick_results):
         return None
     
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Use the latest model that's available
+        model = genai.GenerativeModel('gemini-pro')
         
         prompt = f"""As a cybersecurity expert, analyze this URL for potential attacks:
 
@@ -246,7 +247,9 @@ Identify attack type(s) and provide response in this exact JSON format:
     "severity": "LOW/MEDIUM/HIGH/CRITICAL",
     "explanation": "brief technical explanation",
     "recommendations": ["recommendation1", "recommendation2"]
-}}"""
+}}
+
+Important: Return ONLY the JSON object, no additional text."""
 
         response = model.generate_content(prompt)
         
@@ -256,9 +259,20 @@ Identify attack type(s) and provide response in this exact JSON format:
         text = re.sub(r'```\n?', '', text)
         text = text.strip()
         
-        result = json.loads(text)
-        return result
+        # Try to find JSON in the response
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            return result
+        else:
+            # If no JSON found, try to parse the entire response
+            result = json.loads(text)
+            return result
     
+    except json.JSONDecodeError as e:
+        st.error(f"Gemini API Response Parsing Error: {str(e)}")
+        st.info(f"Raw response: {response.text[:200]}...")
+        return None
     except Exception as e:
         st.error(f"Gemini API Error: {str(e)}")
         return None
@@ -670,8 +684,8 @@ def show_url_analysis():
             if is_malicious:
                 st.session_state.attacks_db.append(analysis_record)
                 
-                # Save to MongoDB
-                if st.session_state.mongo_db:
+                # Save to MongoDB - FIXED: Check if mongo_db is not None
+                if st.session_state.mongo_db is not None:
                     save_detection_to_db(st.session_state.mongo_db, analysis_record.copy())
             
             # Display Results
@@ -845,8 +859,8 @@ def show_bulk_analysis():
                                 results.append(result)
                                 st.session_state.attacks_db.append(result)
                                 
-                                # Save to MongoDB
-                                if st.session_state.mongo_db:
+                                # Save to MongoDB - FIXED: Check if mongo_db is not None
+                                if st.session_state.mongo_db is not None:
                                     save_detection_to_db(st.session_state.mongo_db, result.copy())
                         
                         progress_bar.progress((idx + 1) / len(urls))
@@ -906,7 +920,7 @@ def show_attack_database():
             st.rerun()
     
     # Load data based on source
-    if data_source == "MongoDB History" and st.session_state.mongo_db:
+    if data_source == "MongoDB History" and st.session_state.mongo_db is not None:  # FIXED: Check if not None
         with st.spinner("Loading from MongoDB..."):
             attacks_data = get_detection_history_from_db(st.session_state.mongo_db, limit=500)
             if not attacks_data:
