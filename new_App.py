@@ -92,7 +92,7 @@ if 'analysis_history' not in st.session_state:
 if 'api_key' not in st.session_state:
     st.session_state.api_key = ""
 if 'gemini_model' not in st.session_state:
-    st.session_state.gemini_model = "gemini-1.5-flash"
+    st.session_state.gemini_model = "gemini-2.0-flash"
 if 'performance_stats' not in st.session_state:
     st.session_state.performance_stats = {
         'total_analyses': 0,
@@ -103,12 +103,16 @@ if 'performance_stats' not in st.session_state:
         'attempted_attacks': 0
     }
 
-# Available Gemini models
-GEMINI_MODELS = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro", 
-    "gemini-1.0-pro"
-]
+# Available Gemini models with their limits
+GEMINI_MODELS = {
+    "gemini-2.5-pro": {"requests": 2, "tokens": 125000, "rpm": 50},
+    "gemini-2.5-flash": {"requests": 10, "tokens": 250000, "rpm": 250},
+    "gemini-2.5-flash-preview": {"requests": 10, "tokens": 250000, "rpm": 250},
+    "gemini-2.5-flash-lite": {"requests": 15, "tokens": 250000, "rpm": 1000},
+    "gemini-2.5-flash-lite-preview": {"requests": 15, "tokens": 250000, "rpm": 1000},
+    "gemini-2.0-flash": {"requests": 15, "tokens": 1000000, "rpm": 200},
+    "gemini-2.0-flash-lite": {"requests": 30, "tokens": 1000000, "rpm": 200}
+}
 
 # Cache management
 CACHE_FILE = 'gemini_cache.json'
@@ -551,7 +555,7 @@ def analyze_attack_success(url, detected_attacks, server_response=None, response
     return successful_attacks, success_evidence, attack_status
 
 # Gemini API Configuration and Analysis
-def configure_gemini(api_key, model_name="gemini-1.5-flash"):
+def configure_gemini(api_key, model_name="gemini-2.0-flash"):
     """Configure Google Gemini API with specific model"""
     try:
         genai.configure(api_key=api_key)
@@ -738,7 +742,6 @@ def enhanced_url_analysis(url, use_gemini=True, server_response=None, response_c
     
     return analysis_record
 
-# Enhanced PCAP Analysis
 # Enhanced PCAP Analysis with Error Handling
 def extract_urls_with_ips_from_pcap(pcap_file):
     """Extract URLs with source IPs from PCAP file with robust error handling"""
@@ -750,26 +753,35 @@ def extract_urls_with_ips_from_pcap(pcap_file):
     
     try:
         # Save uploaded file to temporary location
-        temp_path = f"/tmp/{pcap_file.name}"
-        with open(temp_path, "wb") as f:
-            f.write(pcap_file.getvalue())
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pcap') as tmp_file:
+            tmp_file.write(pcap_file.getvalue())
+            temp_path = tmp_file.name
         
         # Use different approach to read PCAP
         packets = []
         try:
+            # Read with count limit to avoid memory issues
             packets = rdpcap(temp_path)
+            st.info(f"📦 Loaded {len(packets)} packets from PCAP")
         except Exception as e:
             st.warning(f"Scapy rdpcap failed: {str(e)}. Trying alternative method...")
-            # Try reading with different parameters
             try:
-                packets = rdpcap(temp_path, count=1000)  # Limit packets for large files
-            except:
-                st.error("Failed to parse PCAP file with Scapy")
+                packets = rdpcap(temp_path, count=500)  # Limit packets for large files
+            except Exception as e2:
+                st.error(f"Failed to parse PCAP file: {str(e2)}")
+                # Clean up temp file
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
                 return urls_with_ips
         
         packet_count = 0
+        url_count = 0
+        
         for packet in packets:
-            if packet_count >= 1000:  # Limit processing for large files
+            if packet_count >= 500:  # Limit processing for large files
                 break
                 
             try:
@@ -789,26 +801,34 @@ def extract_urls_with_ips_from_pcap(pcap_file):
                             urls_with_ips.append({
                                 'url': url,
                                 'source_ip': source_ip,
-                                'timestamp': datetime.fromtimestamp(packet.time).strftime("%Y-%m-%d %H:%M:%S")
+                                'timestamp': datetime.fromtimestamp(float(packet.time)).strftime("%Y-%m-%d %H:%M:%S")
                             })
-                            packet_count += 1
+                            url_count += 1
                     
                     # Also check raw TCP payload for HTTP requests
                     elif packet.haslayer(Raw):
                         try:
                             payload = packet[Raw].load
-                            payload_str = payload.decode('utf-8', errors='ignore')
+                            # Try multiple encodings
+                            for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                                try:
+                                    payload_str = payload.decode(encoding, errors='ignore')
+                                    break
+                                except:
+                                    continue
+                            else:
+                                continue
                             
                             # Look for HTTP methods in payload
                             if any(method in payload_str for method in ['GET ', 'POST ', 'PUT ', 'DELETE ']):
                                 lines = payload_str.split('\r\n')
-                                if lines and any(line.startswith(('GET', 'POST', 'PUT', 'DELETE')) for line in lines):
+                                if lines and any(line.startswith(('GET', 'POST', 'PUT', 'DELETE')) for line in lines[:5]):
                                     request_line = lines[0]
                                     parts = request_line.split()
                                     if len(parts) >= 2:
                                         path = parts[1]
                                         host = ""
-                                        for line in lines[1:]:
+                                        for line in lines[1:10]:  # Check first 10 lines for Host header
                                             if line.lower().startswith('host:'):
                                                 host = line.split(':', 1)[1].strip()
                                                 break
@@ -818,20 +838,24 @@ def extract_urls_with_ips_from_pcap(pcap_file):
                                             urls_with_ips.append({
                                                 'url': url,
                                                 'source_ip': source_ip,
-                                                'timestamp': datetime.fromtimestamp(packet.time).strftime("%Y-%m-%d %H:%M:%S")
+                                                'timestamp': datetime.fromtimestamp(float(packet.time)).strftime("%Y-%m-%d %H:%M:%S")
                                             })
-                                            packet_count += 1
-                        except:
+                                            url_count += 1
+                        except Exception as e:
                             continue
                             
             except Exception as e:
                 continue  # Skip problematic packets
+            
+            packet_count += 1
         
         # Clean up temp file
         try:
-            os.remove(temp_path)
+            os.unlink(temp_path)
         except:
             pass
+            
+        st.success(f"✅ Extracted {url_count} URLs from {packet_count} packets")
             
     except Exception as e:
         st.error(f"Error parsing PCAP: {str(e)}")
@@ -850,7 +874,13 @@ def parse_pcap_with_dpkt_enhanced(pcap_file):
         pcap_data = pcap_file.getvalue()
         pcap = dpkt.pcap.Reader(io.BytesIO(pcap_data))
         
+        url_count = 0
+        packet_count = 0
+        
         for timestamp, buf in pcap:
+            if packet_count >= 500:
+                break
+                
             try:
                 eth = dpkt.ethernet.Ethernet(buf)
                 
@@ -879,6 +909,7 @@ def parse_pcap_with_dpkt_enhanced(pcap_file):
                                 'source_ip': source_ip,
                                 'timestamp': datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
                             })
+                            url_count += 1
                     except:
                         # Manual HTTP parsing
                         try:
@@ -903,13 +934,92 @@ def parse_pcap_with_dpkt_enhanced(pcap_file):
                                                 'source_ip': source_ip,
                                                 'timestamp': datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
                                             })
+                                            url_count += 1
                         except:
                             continue
             except:
                 continue
                 
+            packet_count += 1
+            
+        st.success(f"✅ DPKT: Extracted {url_count} URLs from {packet_count} packets")
+                
     except Exception as e:
         st.error(f"Error parsing PCAP with dpkt: {str(e)}")
+    
+    return urls_with_ips
+
+def manual_pcap_extraction(uploaded_file):
+    """Manual PCAP extraction as last resort"""
+    urls_with_ips = []
+    
+    try:
+        # Read file as binary and look for HTTP patterns
+        content = uploaded_file.getvalue()
+        
+        # Try multiple encodings
+        content_str = ""
+        for encoding in ['utf-8', 'latin-1', 'cp1252']:
+            try:
+                content_str = content.decode(encoding)
+                break
+            except:
+                continue
+        else:
+            content_str = content.decode('latin-1', errors='ignore')
+        
+        # Look for HTTP request patterns
+        import re
+        
+        # More comprehensive URL extraction
+        url_patterns = [
+            r'GET\s+([^\s]+)\s+HTTP/1\.[01]',
+            r'POST\s+([^\s]+)\s+HTTP/1\.[01]', 
+            r'Host:\s*([^\r\n]+)',
+            r'http://[^\s]+',
+            r'https://[^\s]+'
+        ]
+        
+        # Simple IP pattern (basic)
+        ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+        
+        # Extract URLs using multiple methods
+        all_urls = []
+        
+        # Method 1: GET/POST with Host
+        get_matches = re.findall(r'GET\s+([^\s]+)\s+HTTP/1\.[01]', content_str)
+        post_matches = re.findall(r'POST\s+([^\s]+)\s+HTTP/1\.[01]', content_str)
+        host_matches = re.findall(r'Host:\s*([^\r\n]+)', content_str)
+        
+        # Combine GET/POST with Host headers
+        for i, (path, host) in enumerate(zip(get_matches + post_matches, host_matches * 2)):
+            if i < len(host_matches):
+                source_ip = "192.168.1.100"  # Default IP
+                url = f"http://{host.strip()}{path}"
+                all_urls.append((url, source_ip))
+        
+        # Method 2: Direct URL extraction
+        http_urls = re.findall(r'http://[^\s]+', content_str)
+        https_urls = re.findall(r'https://[^\s]+', content_str)
+        
+        for url in http_urls + https_urls:
+            all_urls.append((url, "192.168.1.100"))
+        
+        # Remove duplicates and create final list
+        seen_urls = set()
+        for url, ip in all_urls:
+            if url not in seen_urls and len(url) > 10:  # Basic URL validation
+                seen_urls.add(url)
+                urls_with_ips.append({
+                    'url': url,
+                    'source_ip': ip,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+        
+        st.info(f"🔍 Manual extraction found {len(urls_with_ips)} URLs")
+            
+    except Exception as e:
+        st.error(f"Manual extraction failed: {str(e)}")
     
     return urls_with_ips
 
@@ -933,14 +1043,28 @@ def enhanced_pcap_analysis(uploaded_file, use_gemini=True):
             urls_with_ips = manual_pcap_extraction(uploaded_file)
     
     if not urls_with_ips:
-        st.warning("⚠️ No HTTP URLs extracted from PCAP file. The file may contain:")
-        st.write("- Encrypted HTTPS traffic (cannot be parsed)")
-        st.write("- Non-HTTP protocols")
-        st.write("- Corrupted or incomplete PCAP data")
-        st.write("- Very large file (processing limited to first 1000 packets)")
+        st.warning("""
+        ⚠️ No HTTP URLs extracted from PCAP file. Possible reasons:
+        - Encrypted HTTPS traffic (cannot be parsed)
+        - Non-HTTP protocols (FTP, DNS, etc.)
+        - Corrupted or incomplete PCAP data
+        - Very large file (processing limited to first 500 packets)
+        - Binary data without clear HTTP patterns
+        
+        💡 **Try these solutions:**
+        1. Use a PCAP with clear HTTP traffic
+        2. Try CSV or JSON format with URL column
+        3. Use the URL analysis page for individual URLs
+        """)
         return []
     
-    st.success(f"✅ Extracted {len(urls_with_ips)} URLs from PCAP")
+    st.success(f"✅ Successfully extracted {len(urls_with_ips)} URLs for analysis")
+    
+    # Limit the number of URLs to analyze
+    max_urls_to_analyze = min(50, len(urls_with_ips))  # Limit to 50 URLs max
+    if len(urls_with_ips) > max_urls_to_analyze:
+        st.info(f"📊 Analyzing first {max_urls_to_analyze} URLs (out of {len(urls_with_ips)} total)")
+        urls_with_ips = urls_with_ips[:max_urls_to_analyze]
     
     # Analyze extracted URLs
     results = []
@@ -950,88 +1074,28 @@ def enhanced_pcap_analysis(uploaded_file, use_gemini=True):
     for idx, url_data in enumerate(urls_with_ips):
         status_text.text(f"Analyzing {idx + 1}/{len(urls_with_ips)}: {url_data['url'][:50]}...")
         
-        result = enhanced_url_analysis(
-            url=url_data['url'],
-            use_gemini=use_gemini,
-            source_ip=url_data['source_ip'],
-            server_response=None,
-            response_code=None
-        )
-        
-        results.append(result)
-        progress_bar.progress((idx + 1) / len(urls_with_ips))
-    
-    status_text.text("✅ PCAP analysis complete!")
-    return results
-
-def manual_pcap_extraction(uploaded_file):
-    """Manual PCAP extraction as last resort"""
-    urls_with_ips = []
-    
-    try:
-        # Read file as binary and look for HTTP patterns
-        content = uploaded_file.getvalue()
-        content_str = content.decode('latin-1')  # Use latin-1 to handle binary data
-        
-        # Look for HTTP request patterns
-        http_patterns = [
-            r'GET\s+([^\s]+)\s+HTTP/1\.[01]',
-            r'POST\s+([^\s]+)\s+HTTP/1\.[01]', 
-            r'Host:\s*([^\r\n]+)'
-        ]
-        
-        # Simple IP pattern (basic)
-        ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-        
-        # Extract potential URLs and IPs
-        import re
-        get_matches = re.findall(r'GET\s+([^\s]+)\s+HTTP/1\.[01]', content_str)
-        host_matches = re.findall(r'Host:\s*([^\r\n]+)', content_str)
-        ip_matches = re.findall(ip_pattern, content_str)
-        
-        # Create URL objects with dummy IPs
-        for i, (path, host) in enumerate(zip(get_matches, host_matches)):
-            if i < len(ip_matches):
-                source_ip = ip_matches[i]
-            else:
-                source_ip = "192.168.1.100"  # Default IP
-            
-            url = f"http://{host.strip()}{path}"
-            urls_with_ips.append({
-                'url': url,
-                'source_ip': source_ip,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            result = enhanced_url_analysis(
+                url=url_data['url'],
+                use_gemini=use_gemini,
+                source_ip=url_data['source_ip'],
+                server_response=None,
+                response_code=None
+            )
+            results.append(result)
+        except Exception as e:
+            st.warning(f"Failed to analyze URL {url_data['url'][:50]}: {str(e)}")
+            # Add a basic result for failed analysis
+            results.append({
+                'url': url_data['url'],
+                'source_ip': url_data['source_ip'],
+                'attempted_attacks': [],
+                'successful_attacks': [],
+                'attack_status': 'attempt',
+                'is_malicious': False,
+                'error': str(e)
             })
-            
-    except Exception as e:
-        st.error(f"Manual extraction failed: {str(e)}")
-    
-    return urls_with_ips
-
-def enhanced_pcap_analysis(uploaded_file, use_gemini=True):
-    """Enhanced PCAP analysis with IP tracking"""
-    urls_with_ips = extract_urls_with_ips_from_pcap(uploaded_file)
-    
-    if not urls_with_ips:
-        st.warning("No HTTP traffic with IP information found in PCAP file")
-        return []
-    
-    results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for idx, url_data in enumerate(urls_with_ips):
-        status_text.text(f"Analyzing {idx + 1}/{len(urls_with_ips)}: {url_data['url'][:50]}...")
         
-        result = enhanced_url_analysis(
-            url=url_data['url'],
-            use_gemini=use_gemini,
-            source_ip=url_data['source_ip'],
-            server_response=None,  # Would need response packets for full analysis
-            response_code=None
-        )
-        
-        results.append(result)
         progress_bar.progress((idx + 1) / len(urls_with_ips))
     
     status_text.text("✅ PCAP analysis complete!")
@@ -1246,15 +1310,14 @@ def show_enhanced_bulk_analysis():
         
         with col1:
             use_gemini = st.checkbox("Enable Gemini AI", value=True, disabled=not st.session_state.api_key)
-            analysis_mode = st.selectbox(
-                "Analysis Mode",
-                ["Fast (Patterns Only)", "Standard (Patterns + Success)", "Comprehensive (AI Enhanced)"],
-                index=1
-            )
+            max_urls = st.number_input("Maximum URLs to analyze", min_value=1, max_value=100, value=20)
             
         with col2:
-            max_urls = st.number_input("Maximum URLs to analyze", min_value=1, max_value=1000, value=100)
-            ip_filter = st.text_input("Filter by IP Range (optional)", placeholder="192.168.1.0/24")
+            file_type = st.selectbox(
+                "File Type",
+                ["Auto-detect", "PCAP/PCAPNG", "CSV", "JSON", "TXT"],
+                help="Manually select file type if auto-detection fails"
+            )
     
     if uploaded_file is not None:
         st.success(f"✅ File uploaded: {uploaded_file.name} ({uploaded_file.size / 1024:.2f} KB)")
@@ -1264,66 +1327,137 @@ def show_enhanced_bulk_analysis():
                 try:
                     results = []
                     
-                    if uploaded_file.name.endswith(('.pcap', '.pcapng')):
+                    # Determine file type
+                    if uploaded_file.name.endswith(('.pcap', '.pcapng')) or file_type == "PCAP/PCAPNG":
                         # Enhanced PCAP analysis
                         results = enhanced_pcap_analysis(uploaded_file, use_gemini)
                         
                     else:
                         # Standard file analysis
                         urls = []
-                        if uploaded_file.name.endswith('.csv'):
-                            df = pd.read_csv(uploaded_file)
-                            if 'url' in df.columns:
-                                urls = df['url'].tolist()[:max_urls]
+                        if uploaded_file.name.endswith('.csv') or file_type == "CSV":
+                            try:
+                                df = pd.read_csv(uploaded_file)
+                                if 'url' in df.columns:
+                                    urls = df['url'].dropna().tolist()[:max_urls]
+                                    st.success(f"📊 Loaded {len(urls)} URLs from CSV")
+                                else:
+                                    st.error("CSV file must contain a 'url' column")
+                                    return
+                            except Exception as e:
+                                st.error(f"Error reading CSV: {str(e)}")
+                                return
                         
-                        elif uploaded_file.name.endswith('.json'):
-                            data = json.load(uploaded_file)
-                            if isinstance(data, list):
-                                urls = [item.get('url', '') for item in data if isinstance(item, dict)][:max_urls]
+                        elif uploaded_file.name.endswith('.json') or file_type == "JSON":
+                            try:
+                                data = json.load(uploaded_file)
+                                if isinstance(data, list):
+                                    urls = [item.get('url', '') for item in data if isinstance(item, dict) and item.get('url')][:max_urls]
+                                else:
+                                    urls = [data.get('url', '')] if data and data.get('url') else []
+                                st.success(f"📊 Loaded {len(urls)} URLs from JSON")
+                            except Exception as e:
+                                st.error(f"Error reading JSON: {str(e)}")
+                                return
                         
-                        elif uploaded_file.name.endswith('.txt'):
-                            content = uploaded_file.read().decode('utf-8')
-                            urls = [line.strip() for line in content.split('\n') if line.strip()][:max_urls]
+                        elif uploaded_file.name.endswith('.txt') or file_type == "TXT":
+                            try:
+                                content = uploaded_file.read().decode('utf-8')
+                                urls = [line.strip() for line in content.split('\n') if line.strip() and line.startswith('http')][:max_urls]
+                                st.success(f"📊 Loaded {len(urls)} URLs from text file")
+                            except Exception as e:
+                                st.error(f"Error reading text file: {str(e)}")
+                                return
                         
                         # Analyze URLs
-                        progress_bar = st.progress(0)
-                        for idx, url in enumerate(urls):
-                            result = enhanced_url_analysis(url, use_gemini)
-                            results.append(result)
-                            progress_bar.progress((idx + 1) / len(urls))
+                        if urls:
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            for idx, url in enumerate(urls):
+                                if url and len(url) > 10:  # Basic URL validation
+                                    status_text.text(f"Analyzing {idx + 1}/{len(urls)}: {url[:50]}...")
+                                    result = enhanced_url_analysis(url, use_gemini)
+                                    results.append(result)
+                                progress_bar.progress((idx + 1) / len(urls))
+                            
+                            status_text.text("✅ Analysis complete!")
+                        else:
+                            st.warning("No valid URLs found in the file")
+                            return
                     
                     # Display results
                     if results:
-                        successful = [r for r in results if r['attack_status'] == 'success']
-                        attempts = [r for r in results if r['is_malicious'] and r['attack_status'] == 'attempt']
+                        successful = [r for r in results if r.get('attack_status') == 'success']
+                        attempts = [r for r in results if r.get('is_malicious') and r.get('attack_status') == 'attempt']
+                        safe = [r for r in results if not r.get('is_malicious')]
                         
-                        st.success(f"🎯 Analysis Complete: {len(successful)} successful, {len(attempts)} attempts out of {len(results)} URLs")
-                        
-                        # Summary statistics
-                        col1, col2, col3 = st.columns(3)
+                        st.success(f"🎯 Analysis Complete!")
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Total URLs", len(results))
                         with col2:
                             st.metric("Successful Attacks", len(successful))
                         with col3:
                             st.metric("Attack Attempts", len(attempts))
+                        with col4:
+                            st.metric("Safe URLs", len(safe))
+                        
+                        # Show detailed results
+                        if results:
+                            st.subheader("📋 Detailed Results")
+                            results_df = pd.DataFrame(results)
+                            
+                            # Create display dataframe
+                            display_cols = ['url', 'attack_status', 'final_attack_types', 'severity', 'confidence']
+                            available_cols = [col for col in display_cols if col in results_df.columns]
+                            
+                            display_df = pd.DataFrame({
+                                'URL Preview': results_df['url'].str[:60] + '...',
+                                'Status': results_df['attack_status'].apply(lambda x: f"🔴 {x.upper()}" if x == 'success' else f"🟡 {x.upper()}" if x == 'attempt' else "✅ SAFE"),
+                                'Attack Types': results_df['final_attack_types'].apply(lambda x: ', '.join(x) if x else 'None'),
+                                'Severity': results_df['severity'],
+                                'Confidence': results_df['confidence'].apply(lambda x: f"{x}%")
+                            })
+                            st.dataframe(display_df, use_container_width=True, hide_index=True)
                         
                         # Export results
-                        if st.button("📥 Export Results (CSV)"):
-                            df = pd.DataFrame(results)
-                            csv = df.to_csv(index=False)
-                            st.download_button(
-                                label="Download CSV",
-                                data=csv,
-                                file_name=f"enhanced_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv"
-                            )
+                        st.subheader("📥 Export Results")
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            if st.button("Export as CSV"):
+                                csv = pd.DataFrame(results).to_csv(index=False)
+                                st.download_button(
+                                    label="Download CSV",
+                                    data=csv,
+                                    file_name=f"cyber_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    mime="text/csv"
+                                )
+                        
+                        with col2:
+                            if st.button("Export as JSON"):
+                                json_data = pd.DataFrame(results).to_json(orient='records', indent=2)
+                                st.download_button(
+                                    label="Download JSON",
+                                    data=json_data,
+                                    file_name=f"cyber_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                    mime="application/json"
+                                )
                     
                     else:
-                        st.warning("No results generated from the analysis")
+                        st.error("❌ No results generated from the analysis")
+                        st.info("""
+                        💡 **Troubleshooting tips:**
+                        1. For PCAP files: Ensure they contain HTTP traffic
+                        2. For CSV/JSON: Make sure there's a 'url' column with valid URLs
+                        3. For text files: Ensure each line contains a complete URL starting with http:// or https://
+                        4. Try the URL Analysis page for individual URL testing
+                        """)
                         
                 except Exception as e:
                     st.error(f"Error during analysis: {str(e)}")
+                    st.info("💡 Try using the URL Analysis page to test individual URLs first")
 
 def show_enhanced_attack_database():
     """Enhanced attack database with advanced filtering"""
@@ -1486,16 +1620,33 @@ def main():
         # API Key Input
         api_key = st.text_input("🔑 Google Gemini API Key", type="password", value=st.session_state.api_key)
         
-        # Model Selection
-        selected_model = st.selectbox(
-            "🤖 Gemini Model",
-            options=GEMINI_MODELS,
-            index=GEMINI_MODELS.index(st.session_state.gemini_model) if st.session_state.gemini_model in GEMINI_MODELS else 0
+        # Model Selection with limits display
+        st.subheader("🤖 Gemini Model Selection")
+        
+        # Create model options with limits information
+        model_options = []
+        for model_name, limits in GEMINI_MODELS.items():
+            display_name = f"{model_name} (RPM: {limits['rpm']}, Tokens: {limits['tokens']:,})"
+            model_options.append((model_name, display_name))
+        
+        # Create dropdown with formatted options
+        selected_model_display = st.selectbox(
+            "Select Model",
+            options=[display for _, display in model_options],
+            index=2,  # Default to gemini-2.0-flash
+            help="Select Gemini model based on your rate limits and token requirements"
         )
+        
+        # Get the actual model name from display
+        selected_model = None
+        for model_name, display_name in model_options:
+            if display_name == selected_model_display:
+                selected_model = model_name
+                break
         
         if api_key != st.session_state.api_key or selected_model != st.session_state.gemini_model:
             st.session_state.api_key = api_key
-            if api_key:
+            if api_key and selected_model:
                 if configure_gemini(api_key, selected_model):
                     st.success(f"✅ API configured with {selected_model}!")
         
