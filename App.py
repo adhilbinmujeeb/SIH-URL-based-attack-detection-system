@@ -253,7 +253,7 @@ def analyze_with_gemini(url, quick_results):
         return None
     
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         
         prompt = f"""As a cybersecurity expert, analyze this URL for potential attacks:
 
