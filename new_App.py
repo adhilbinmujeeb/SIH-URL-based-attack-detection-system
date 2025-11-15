@@ -560,47 +560,6 @@ def parse_pcap_simple_dpkt(pcap_file):
         st.error(f"Error parsing PCAP with dpkt: {str(e)}")
         return []
 
-def parse_pcap_file_robust(uploaded_file):
-    """Robust PCAP parsing that handles various formats and errors"""
-    urls = []
-    
-    st.info("🔄 Attempting to parse PCAP file...")
-    
-    # Try Scapy first
-    if PCAP_SUPPORT:
-        with st.spinner("Trying Scapy parser..."):
-            try:
-                urls = parse_pcap_simple_scapy(uploaded_file)
-                if urls:
-                    st.success(f"✅ Scapy extracted {len(urls)} URLs")
-                    return urls
-            except Exception as e:
-                st.warning(f"Scapy parser failed: {str(e)}")
-    
-    # Try dpkt if Scapy fails
-    if not urls and DPKT_SUPPORT:
-        with st.spinner("Trying dpkt parser..."):
-            try:
-                urls = parse_pcap_simple_dpkt(uploaded_file)
-                if urls:
-                    st.success(f"✅ dpkt extracted {len(urls)} URLs")
-                    return urls
-            except Exception as e:
-                st.warning(f"dpkt parser failed: {str(e)}")
-    
-    # If both fail, try manual parsing as last resort
-    if not urls:
-        urls = parse_pcap_manual(uploaded_file)
-    
-    if not urls:
-        st.warning("❌ No HTTP URLs found in PCAP file. The file might be:")
-        st.warning("- Encrypted traffic (HTTPS)")
-        st.warning("- Non-HTTP protocol")
-        st.warning("- Corrupted or invalid PCAP format")
-        st.warning("- Empty or very small file")
-    
-    return urls
-
 def parse_pcap_manual(uploaded_file):
     """Manual PCAP parsing as last resort"""
     urls = []
@@ -652,6 +611,47 @@ def parse_pcap_manual(uploaded_file):
         
     except Exception as e:
         st.error(f"Manual PCAP parsing failed: {str(e)}")
+    
+    return urls
+
+def parse_pcap_file_robust(uploaded_file):
+    """Robust PCAP parsing that handles various formats and errors"""
+    urls = []
+    
+    st.info("🔄 Attempting to parse PCAP file...")
+    
+    # Try Scapy first
+    if PCAP_SUPPORT:
+        with st.spinner("Trying Scapy parser..."):
+            try:
+                urls = parse_pcap_simple_scapy(uploaded_file)
+                if urls:
+                    st.success(f"✅ Scapy extracted {len(urls)} URLs")
+                    return urls
+            except Exception as e:
+                st.warning(f"Scapy parser failed: {str(e)}")
+    
+    # Try dpkt if Scapy fails
+    if not urls and DPKT_SUPPORT:
+        with st.spinner("Trying dpkt parser..."):
+            try:
+                urls = parse_pcap_simple_dpkt(uploaded_file)
+                if urls:
+                    st.success(f"✅ dpkt extracted {len(urls)} URLs")
+                    return urls
+            except Exception as e:
+                st.warning(f"dpkt parser failed: {str(e)}")
+    
+    # If both fail, try manual parsing as last resort
+    if not urls:
+        urls = parse_pcap_manual(uploaded_file)
+    
+    if not urls:
+        st.warning("❌ No HTTP URLs found in PCAP file. The file might be:")
+        st.warning("- Encrypted traffic (HTTPS)")
+        st.warning("- Non-HTTP protocol")
+        st.warning("- Corrupted or invalid PCAP format")
+        st.warning("- Empty or very small file")
     
     return urls
 
@@ -1145,14 +1145,14 @@ def show_bulk_analysis():
         if st.button("🚀 Start Analysis", type="primary"):
             with st.spinner("Processing file..."):
                 try:
-                    urls = []
+                    url_data = []
                     
                     # Read file based on type
                     if uploaded_file.name.endswith(('.pcap', '.pcapng')):
                         if PCAP_SUPPORT or DPKT_SUPPORT:
-                            urls = parse_pcap_file_robust(uploaded_file)
-                            if urls:
-                                st.success(f"📊 Successfully extracted {len(urls)} URLs from PCAP")
+                            url_data = parse_pcap_file_robust(uploaded_file)
+                            if url_data:
+                                st.success(f"📊 Successfully extracted {len(url_data)} URLs from PCAP")
                             else:
                                 st.error("❌ Failed to extract URLs from PCAP file")
                                 return
@@ -1166,7 +1166,9 @@ def show_bulk_analysis():
                         
                         url_columns = [col for col in df.columns if 'url' in col.lower()]
                         if url_columns:
+                            # Convert to list of dictionaries for consistent processing
                             urls = df[url_columns[0]].dropna().tolist()
+                            url_data = [{'url': url} for url in urls]
                         else:
                             st.error("CSV must contain a URL column")
                             return
@@ -1175,29 +1177,37 @@ def show_bulk_analysis():
                         data = json.load(uploaded_file)
                         if isinstance(data, list):
                             # Try to find URL fields
-                            urls = []
+                            url_data = []
                             for item in data:
                                 if isinstance(item, dict):
                                     for key, value in item.items():
                                         if 'url' in key.lower() and isinstance(value, str):
-                                            urls.append(value)
+                                            url_data.append({'url': value})
                                             break
                         else:
-                            urls = [data.get('url', '')] if isinstance(data, dict) else []
-                        st.info(f"📊 Loaded {len(urls)} URLs from JSON")
+                            url = data.get('url', '')
+                            url_data = [{'url': url}] if url else []
+                        st.info(f"📊 Loaded {len(url_data)} URLs from JSON")
                     
                     elif uploaded_file.name.endswith('.txt'):
                         content = uploaded_file.read().decode('utf-8')
                         urls = [line.strip() for line in content.split('\n') if line.strip() and line.startswith('http')]
-                        st.info(f"📊 Loaded {len(urls)} URLs from text file")
+                        url_data = [{'url': url} for url in urls]
+                        st.info(f"📊 Loaded {len(url_data)} URLs from text file")
                     
-                    if not urls:
+                    if not url_data:
                         st.warning("No URLs found in file")
                         return
                     
-                    # Remove duplicates
-                    urls = list(set(urls))
-                    st.info(f"🔍 Analyzing {len(urls)} unique URLs...")
+                    # Remove duplicate URLs (extract URL strings for deduplication)
+                    unique_urls = {}
+                    for item in url_data:
+                        url = item['url']
+                        if url not in unique_urls:
+                            unique_urls[url] = item
+                    
+                    url_data = list(unique_urls.values())
+                    st.info(f"🔍 Analyzing {len(url_data)} unique URLs...")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
@@ -1205,8 +1215,9 @@ def show_bulk_analysis():
                     
                     results = []
                     
-                    for idx, url in enumerate(urls):
-                        status_text.text(f"Analyzing {idx + 1}/{len(urls)}: {url[:50]}...")
+                    for idx, item in enumerate(url_data):
+                        url = item['url']
+                        status_text.text(f"Analyzing {idx + 1}/{len(url_data)}: {url[:50]}...")
                         
                         # Extract IP information
                         src_ip = extract_ip_from_url(url)
@@ -1246,6 +1257,16 @@ def show_bulk_analysis():
                                 'ip_info': ip_info
                             }
                             
+                            # Add additional PCAP data if available
+                            if 'src_ip' in item and item['src_ip'] != 'Unknown':
+                                result.update({
+                                    'src_ip': item.get('src_ip'),
+                                    'dst_ip': item.get('dst_ip'),
+                                    'method': item.get('method'),
+                                    'src_port': item.get('src_port'),
+                                    'dst_port': item.get('dst_port')
+                                })
+                            
                             results.append(result)
                             st.session_state.attacks_db.append(result)
                             
@@ -1253,13 +1274,13 @@ def show_bulk_analysis():
                             if st.session_state.mongo_db is not None:
                                 save_detection_to_db(st.session_state.mongo_db, result.copy())
                         
-                        progress_bar.progress((idx + 1) / len(urls))
+                        progress_bar.progress((idx + 1) / len(url_data))
                     
                     status_text.text("✅ Analysis complete!")
                     
                     # Display results
                     if results:
-                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
+                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(url_data)} URLs")
                         
                         # Summary statistics
                         col1, col2, col3, col4 = st.columns(4)
