@@ -1,34 +1,24 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import pickle
+import re
+from urllib.parse import unquote
+import subprocess
+import tempfile
+import os
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from io import BytesIO
 import json
-import google.generativeai as genai
-import re
-from collections import Counter
-import time
-import io
-import pymongo
-from pymongo import MongoClient
-
-# Try to import PCAP libraries
-try:
-    from scapy.all import rdpcap, TCP, Raw
-    from scapy.layers.http import HTTPRequest
-    PCAP_SUPPORT = True
-except ImportError:
-    PCAP_SUPPORT = False
-
-try:
-    import dpkt
-    DPKT_SUPPORT = True
-except ImportError:
-    DPKT_SUPPORT = False
 
 # Page configuration
 st.set_page_config(
-    page_title="Cyber Attack Detection System",
+    page_title="HTTP Attack Detection System",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -39,1274 +29,546 @@ st.markdown("""
 <style>
     .main-header {
         font-size: 2.5rem;
-        font-weight: bold;
-        color: #1E90FF;
+        color: #1f77b4;
         text-align: center;
-        padding: 1rem 0;
+        margin-bottom: 2rem;
     }
-    .stat-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-    }
-    .attack-card {
-        border-left: 4px solid #FF4444;
+    .metric-card {
+        background-color: #f0f2f6;
         padding: 1rem;
-        margin: 1rem 0;
-        background-color: #f8f9fa;
-        border-radius: 5px;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
     }
-    .safe-card {
-        border-left: 4px solid #44FF44;
+    .attack-alert {
+        background-color: #ffebee;
         padding: 1rem;
-        margin: 1rem 0;
-        background-color: #f8f9fa;
-        border-radius: 5px;
-    }
-    .pattern-info {
-        background-color: #e7f3ff;
-        padding: 0.5rem;
-        border-radius: 5px;
-        margin: 0.25rem 0;
-        font-size: 0.9rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #f44336;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'attacks_db' not in st.session_state:
-    st.session_state.attacks_db = []
-if 'analysis_history' not in st.session_state:
-    st.session_state.analysis_history = []
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
-if 'mongodb_connected' not in st.session_state:
-    st.session_state.mongodb_connected = False
-if 'mongodb_client' not in st.session_state:
-    st.session_state.mongodb_client = None
-if 'mongodb_db' not in st.session_state:
-    st.session_state.mongodb_db = None
-if 'attack_patterns' not in st.session_state:
-    st.session_state.attack_patterns = {}
-if 'mongodb_connection_string' not in st.session_state:
-    st.session_state.mongodb_connection_string = ""
+# Attack pattern definitions
+ATTACK_PATTERNS = {
+    'sql_injection': [
+        r"(\bunion\b.*\bselect\b)", r"(\bselect\b.*\bfrom\b)", 
+        r"(\binsert\b.*\binto\b)", r"(\bdelete\b.*\bfrom\b)",
+        r"(\bdrop\b.*\btable\b)", r"(\bupdate\b.*\bset\b)",
+        r"'.*--", r"'.*or.*'.*=.*'", r"\bor\b.*\b1\b.*=.*\b1\b",
+        r"%27", r"0x[0-9a-f]+", r"\bunion\b", r"\bexec\b",
+        r"char\(", r"concat\(", r"information_schema"
+    ],
+    'xss': [
+        r"<script[^>]*>.*?</script>", r"javascript:", r"onerror\s*=",
+        r"onload\s*=", r"<img[^>]+src", r"<iframe", r"alert\(",
+        r"document\.cookie", r"<svg", r"onmouseover\s*=",
+        r"%3Cscript", r"expression\(", r"vbscript:"
+    ],
+    'directory_traversal': [
+        r"\.\./", r"\.\.", r"%2e%2e", r"\.\.\\",
+        r"/etc/passwd", r"/windows/system32", r"c:\\", r"d:\\",
+        r"%2e%2e%2f", r"..%2f", r"..%5c"
+    ],
+    'command_injection': [
+        r";\s*\w+", r"\|\s*\w+", r"&&\s*\w+", r"`.*`",
+        r"\$\(.*\)", r">\s*/", r"<\s*/", r"\bwget\b",
+        r"\bcurl\b", r"\bcat\b", r"\bls\b", r"\brm\b",
+        r"\bchmod\b", r"\bchown\b", r"%0a", r"%0d"
+    ],
+    'ssrf': [
+        r"(http|https)://localhost", r"(http|https)://127\.0\.0\.1",
+        r"(http|https)://192\.168\.", r"(http|https)://10\.",
+        r"(http|https)://172\.(1[6-9]|2[0-9]|3[0-1])\.",
+        r"file://", r"dict://", r"gopher://", r"@localhost"
+    ],
+    'lfi_rfi': [
+        r"(include|require).*\.(php|asp|jsp)", r"\.\./(.*\.php)",
+        r"php://", r"data://", r"expect://", r"zip://",
+        r"\?page=http", r"\?file=http", r"php://filter",
+        r"php://input"
+    ],
+    'xxe_injection': [
+        r"<!ENTITY", r"<!DOCTYPE", r"SYSTEM\s+['\"]",
+        r"file:///", r"php://filter", r"<\?xml"
+    ],
+    'parameter_pollution': [
+        r"&\w+=.*&\1=", r"\?\w+=.*&\1=", r"&{2,}",
+        r"={2,}", r"%26%26", r"%3D%3D"
+    ],
+    'brute_force': [
+        r"(login|signin|auth).*password", r"(admin|root|test)",
+        r"(passwd|pwd|pass)=", r"user(name)?="
+    ],
+    'web_shell': [
+        r"cmd\.jsp", r"backdoor\.(php|asp|jsp)", r"shell\.(php|asp|jsp)",
+        r"c99\.php", r"r57\.php", r"webshell", r"eval\(base64_decode"
+    ]
+}
 
-# MongoDB Connection Functions
-def connect_to_mongodb(connection_string):
-    """Connect to MongoDB Atlas"""
+class HTTPAttackDetector:
+    """Main class for HTTP attack detection"""
+    
+    def __init__(self):
+        self.model = None
+        self.label_encoder = LabelEncoder()
+        self.feature_names = []
+        
+    def extract_url_features(self, url):
+        """Extract features from URL for ML model"""
+        if pd.isna(url) or url == '':
+            url = ''
+        
+        url_decoded = unquote(str(url))
+        
+        features = {
+            'url_length': len(url),
+            'num_dots': url.count('.'),
+            'num_slashes': url.count('/'),
+            'num_questionmarks': url.count('?'),
+            'num_ampersands': url.count('&'),
+            'num_equals': url.count('='),
+            'num_hyphens': url.count('-'),
+            'num_underscores': url.count('_'),
+            'num_percent': url.count('%'),
+            'num_special_chars': sum([url.count(c) for c in ['<', '>', '"', "'", ';', '(', ')', '{', '}', '[', ']']]),
+            'has_script_tag': int('<script' in url_decoded.lower()),
+            'has_sql_keywords': int(bool(re.search(r'\b(select|union|insert|update|delete|drop|exec|execute)\b', url_decoded.lower()))),
+            'has_traversal': int(bool(re.search(r'\.\.|%2e%2e', url_decoded.lower()))),
+            'has_command_chars': int(bool(re.search(r'[|;&`$]', url))),
+            'entropy': self._calculate_entropy(url),
+            'digit_ratio': sum(c.isdigit() for c in url) / max(len(url), 1),
+            'uppercase_ratio': sum(c.isupper() for c in url) / max(len(url), 1),
+        }
+        
+        return features
+    
+    def _calculate_entropy(self, text):
+        """Calculate Shannon entropy of text"""
+        if not text:
+            return 0
+        entropy = 0
+        for x in set(text):
+            p_x = text.count(x) / len(text)
+            entropy += - p_x * np.log2(p_x)
+        return entropy
+    
+    def detect_attack_type(self, url):
+        """Detect specific attack type using pattern matching"""
+        if pd.isna(url) or url == '':
+            return 'benign'
+        
+        url_decoded = unquote(str(url).lower())
+        detected_attacks = []
+        
+        for attack_type, patterns in ATTACK_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, url_decoded, re.IGNORECASE):
+                    detected_attacks.append(attack_type)
+                    break
+        
+        if detected_attacks:
+            return detected_attacks[0]  # Return first detected attack
+        return 'benign'
+    
+    def train_model(self, df, url_column, label_column):
+        """Train the ML model"""
+        st.info("Training model... This may take a few minutes.")
+        
+        # Extract features
+        features_list = []
+        for idx, row in df.iterrows():
+            features = self.extract_url_features(row[url_column])
+            features_list.append(features)
+        
+        X = pd.DataFrame(features_list)
+        self.feature_names = X.columns.tolist()
+        
+        # Encode labels
+        y = self.label_encoder.fit_transform(df[label_column])
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Train model
+        self.model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=20,
+            random_state=42,
+            n_jobs=-1
+        )
+        self.model.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred = self.model.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        return accuracy, X_test, y_test, y_pred
+    
+    def predict(self, url):
+        """Predict attack type for a single URL"""
+        if self.model is None:
+            return "benign", 0.0
+        
+        features = self.extract_url_features(url)
+        X = pd.DataFrame([features])
+        
+        prediction = self.model.predict(X)[0]
+        probabilities = self.model.predict_proba(X)[0]
+        confidence = max(probabilities)
+        
+        label = self.label_encoder.inverse_transform([prediction])[0]
+        
+        # Also use pattern matching
+        pattern_detection = self.detect_attack_type(url)
+        
+        return label, confidence, pattern_detection
+
+
+def parse_pcap_to_dataframe(pcap_file):
+    """Parse PCAP file using tshark and return DataFrame"""
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pcap') as tmp:
+        tmp.write(pcap_file.read())
+        tmp_path = tmp.name
+    
     try:
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        client.admin.command('ping')
-        db = client['cyber_attack_detection']
-        return client, db
+        # Check if tshark is available
+        tshark_fields = [
+            'frame.number', 'frame.time', 'frame.len',
+            'ip.src', 'ip.dst', 'tcp.srcport', 'tcp.dstport',
+            'http.request.method', 'http.request.uri', 
+            'http.request.full_uri', 'http.host',
+            'http.user_agent', 'http.response.code'
+        ]
+        
+        cmd = ['tshark', '-r', tmp_path, '-T', 'fields']
+        for field in tshark_fields:
+            cmd.extend(['-e', field])
+        cmd.extend(['-E', 'header=y', '-E', 'separator=,'])
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            st.error("TShark not found. Please install Wireshark/TShark.")
+            return None
+        
+        # Parse output
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            st.warning("No HTTP traffic found in PCAP file.")
+            return None
+        
+        # Create DataFrame
+        from io import StringIO
+        df = pd.read_csv(StringIO(result.stdout))
+        
+        # Filter only HTTP requests
+        df = df[df['http.request.uri'].notna()].reset_index(drop=True)
+        
+        return df
+        
     except Exception as e:
-        st.error(f"❌ MongoDB connection failed: {str(e)}")
-        return None, None
-
-def load_attack_patterns(db):
-    """Load attack patterns from MongoDB"""
-    try:
-        collection = db['attack_patterns']
-        patterns = {}
-        
-        for doc in collection.find({'active': True}):
-            attack_id = doc.get('attack_id')
-            patterns[attack_id] = {
-                'category': doc.get('category'),
-                'description': doc.get('description'),
-                'severity': doc.get('severity'),
-                'patterns': doc.get('patterns', []),
-                'mitigation': doc.get('mitigation', [])
-            }
-        
-        return patterns
-    except Exception as e:
-        st.error(f"Error loading patterns: {str(e)}")
-        return {}
-
-def get_detection_config(db):
-    """Get detection configuration from MongoDB"""
-    try:
-        config_collection = db['detection_config']
-        config = config_collection.find_one({'config_id': 'comprehensive_v2'})
-        return config if config else {}
-    except Exception as e:
-        st.error(f"Error loading config: {str(e)}")
-        return {}
-
-def save_detection_to_mongodb(db, detection_record):
-    """Save detection results to MongoDB"""
-    try:
-        detections_collection = db['detections']
-        detections_collection.insert_one(detection_record)
-        
-        # Update statistics
-        stats_collection = db['attack_statistics']
-        stats = stats_collection.find_one({'stat_id': 'initial'})
-        
-        if stats:
-            # Update statistics
-            stats['total_detections'] += 1
-            
-            # Update by category
-            for attack_type in detection_record.get('attack_types', []):
-                if attack_type in stats['detections_by_category']:
-                    stats['detections_by_category'][attack_type] += 1
-                else:
-                    stats['detections_by_category'][attack_type] = 1
-            
-            # Update by severity
-            severity = detection_record.get('severity', 'LOW')
-            if severity in stats['detections_by_severity']:
-                stats['detections_by_severity'][severity] += 1
-            
-            stats['last_updated'] = datetime.now()
-            
-            stats_collection.update_one(
-                {'stat_id': 'initial'},
-                {'$set': stats}
-            )
-        
-        return True
-    except Exception as e:
-        st.error(f"Error saving to MongoDB: {str(e)}")
-        return False
-
-# Gemini API Configuration
-def configure_gemini(api_key):
-    """Configure Google Gemini API"""
-    try:
-        genai.configure(api_key=api_key)
-        return True
-    except Exception as e:
-        st.error(f"Error configuring Gemini API: {str(e)}")
-        return False
-
-# MongoDB-based Attack Detection
-def detect_attacks_from_mongodb(url, attack_patterns):
-    """Detect attacks using patterns from MongoDB"""
-    detected_attacks = {}
-    all_matched_patterns = []
-    
-    for attack_id, pattern_data in attack_patterns.items():
-        category = pattern_data['category']
-        severity = pattern_data['severity']
-        patterns = pattern_data['patterns']
-        
-        matched_patterns = []
-        
-        for pattern in patterns:
-            regex = pattern.get('regex', '')
-            description = pattern.get('description', '')
-            
-            try:
-                if re.search(regex, url, re.IGNORECASE):
-                    matched_patterns.append({
-                        'description': description,
-                        'example': pattern.get('example', ''),
-                        'regex': regex
-                    })
-            except re.error:
-                continue
-        
-        if matched_patterns:
-            detected_attacks[attack_id] = {
-                'category': category,
-                'severity': severity,
-                'matched_patterns': matched_patterns,
-                'pattern_count': len(matched_patterns),
-                'mitigation': pattern_data.get('mitigation', [])
-            }
-            all_matched_patterns.extend(matched_patterns)
-    
-    return detected_attacks, all_matched_patterns
-
-def calculate_confidence_score(detected_attacks, all_matched_patterns):
-    """Calculate confidence score based on detections"""
-    if not detected_attacks:
-        return 0
-    
-    # Base score on number of patterns matched
-    pattern_score = min(len(all_matched_patterns) * 15, 60)
-    
-    # Severity multiplier
-    severity_weights = {'CRITICAL': 1.5, 'HIGH': 1.3, 'MEDIUM': 1.1, 'LOW': 1.0}
-    max_severity_weight = max([severity_weights.get(data['severity'], 1.0) 
-                               for data in detected_attacks.values()])
-    
-    # Category diversity bonus
-    category_bonus = min(len(detected_attacks) * 5, 20)
-    
-    confidence = min((pattern_score * max_severity_weight) + category_bonus, 99)
-    
-    return int(confidence)
-
-def determine_overall_severity(detected_attacks):
-    """Determine overall severity from detected attacks"""
-    if not detected_attacks:
-        return "LOW"
-    
-    severity_priority = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
-    
-    for severity in severity_priority:
-        for attack_data in detected_attacks.values():
-            if attack_data['severity'] == severity:
-                return severity
-    
-    return "LOW"
-
-def analyze_with_gemini(url, detected_attacks):
-    """Analyze URL with Google Gemini API"""
-    if not st.session_state.api_key:
+        st.error(f"Error parsing PCAP: {str(e)}")
         return None
-    
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        
-        attack_categories = [data['category'] for data in detected_attacks.values()]
-        
-        prompt = f"""As a cybersecurity expert, analyze this URL for potential attacks:
+    finally:
+        os.unlink(tmp_path)
 
-URL: {url}
 
-Pre-detected attack categories: {', '.join(attack_categories) if attack_categories else 'None'}
-
-Provide a detailed security analysis including:
-1. Confirmation or refinement of detected attack types
-2. Additional attack vectors not initially detected
-3. Technical explanation of the attack mechanism
-4. Risk assessment and potential impact
-5. Specific mitigation recommendations
-
-Response format (JSON):
-{{
-    "is_malicious": true/false,
-    "attack_types": ["type1", "type2"],
-    "confidence": 0-100,
-    "severity": "LOW/MEDIUM/HIGH/CRITICAL",
-    "explanation": "detailed technical explanation",
-    "attack_mechanism": "how the attack works",
-    "potential_impact": "what could happen",
-    "recommendations": ["recommendation1", "recommendation2"]
-}}"""
-
-        response = model.generate_content(prompt)
-        
-        # Extract JSON from response
-        text = response.text
-        text = re.sub(r'```json\n?', '', text)
-        text = re.sub(r'```\n?', '', text)
-        text = text.strip()
-        
-        result = json.loads(text)
-        return result
-    
-    except Exception as e:
-        st.error(f"Gemini API Error: {str(e)}")
-        return None
-
-# PCAP Parsing Functions
-def parse_pcap_with_scapy(pcap_file):
-    """Parse PCAP file using Scapy"""
-    urls = []
-    try:
-        packets = rdpcap(pcap_file)
-        
-        for packet in packets:
-            if packet.haslayer(HTTPRequest):
-                http_layer = packet[HTTPRequest]
-                host = http_layer.Host.decode() if http_layer.Host else ""
-                path = http_layer.Path.decode() if http_layer.Path else ""
-                
-                if host and path:
-                    url = f"http://{host}{path}"
-                    urls.append(url)
-            
-            elif packet.haslayer(TCP) and packet.haslayer(Raw):
-                payload = packet[Raw].load
-                try:
-                    payload_str = payload.decode('utf-8', errors='ignore')
-                    
-                    if payload_str.startswith(('GET', 'POST', 'PUT', 'DELETE')):
-                        lines = payload_str.split('\r\n')
-                        if lines:
-                            request_line = lines[0]
-                            parts = request_line.split()
-                            if len(parts) >= 2:
-                                path = parts[1]
-                                
-                                host = ""
-                                for line in lines[1:]:
-                                    if line.lower().startswith('host:'):
-                                        host = line.split(':', 1)[1].strip()
-                                        break
-                                
-                                if host and path:
-                                    url = f"http://{host}{path}"
-                                    urls.append(url)
-                except:
-                    continue
-        
-        return urls
-    except Exception as e:
-        st.error(f"Error parsing PCAP with Scapy: {str(e)}")
-        return []
-
-def parse_pcap_with_dpkt(pcap_file):
-    """Parse PCAP file using dpkt"""
-    urls = []
-    try:
-        pcap_file.seek(0)
-        pcap = dpkt.pcap.Reader(pcap_file)
-        
-        for timestamp, buf in pcap:
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-                
-                if not isinstance(eth.data, dpkt.ip.IP):
-                    continue
-                
-                ip = eth.data
-                
-                if not isinstance(ip.data, dpkt.tcp.TCP):
-                    continue
-                
-                tcp = ip.data
-                
-                if len(tcp.data) > 0:
-                    try:
-                        request = dpkt.http.Request(tcp.data)
-                        host = request.headers.get('host', '')
-                        uri = request.uri
-                        
-                        if host and uri:
-                            url = f"http://{host}{uri}"
-                            urls.append(url)
-                    except:
-                        payload = tcp.data.decode('utf-8', errors='ignore')
-                        if payload.startswith(('GET', 'POST', 'PUT', 'DELETE')):
-                            lines = payload.split('\r\n')
-                            if lines:
-                                request_line = lines[0]
-                                parts = request_line.split()
-                                if len(parts) >= 2:
-                                    path = parts[1]
-                                    
-                                    host = ""
-                                    for line in lines[1:]:
-                                        if line.lower().startswith('host:'):
-                                            host = line.split(':', 1)[1].strip()
-                                            break
-                                    
-                                    if host and path:
-                                        url = f"http://{host}{path}"
-                                        urls.append(url)
-            except:
-                continue
-        
-        return urls
-    except Exception as e:
-        st.error(f"Error parsing PCAP with dpkt: {str(e)}")
-        return []
-
-def parse_pcap_file(uploaded_file):
-    """Parse PCAP file and extract URLs"""
-    urls = []
-    
-    if PCAP_SUPPORT:
-        with st.spinner("Parsing PCAP with Scapy..."):
-            temp_path = f"/tmp/{uploaded_file.name}"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getvalue())
-            
-            urls = parse_pcap_with_scapy(temp_path)
-    
-    if not urls and DPKT_SUPPORT:
-        with st.spinner("Parsing PCAP with dpkt..."):
-            uploaded_file.seek(0)
-            urls = parse_pcap_with_dpkt(uploaded_file)
-    
-    if not urls:
-        if not PCAP_SUPPORT and not DPKT_SUPPORT:
-            st.error("PCAP parsing requires scapy or dpkt libraries.")
-        else:
-            st.warning("No HTTP URLs found in PCAP file.")
-    
-    return urls
-
-# Main Application
 def main():
+    st.markdown('<h1 class="main-header">🛡️ HTTP Attack Detection System</h1>', unsafe_allow_html=True)
+    
     # Sidebar
     with st.sidebar:
-        st.image("https://img.icons8.com/clouds/200/security-checked.png", width=150)
-        st.title("🛡️ Cyber Attack Detector")
-        st.markdown("---")
-        
-        # MongoDB Connection
-        st.subheader("🗄️ MongoDB Configuration")
-        mongodb_string = st.text_input(
-            "MongoDB Connection String",
-            type="password",
-            value=st.session_state.mongodb_connection_string,
-            placeholder="mongodb+srv://..."
-        )
-        
-        if mongodb_string != st.session_state.mongodb_connection_string:
-            st.session_state.mongodb_connection_string = mongodb_string
-        
-        if st.button("Connect to MongoDB", type="primary"):
-            with st.spinner("Connecting to MongoDB..."):
-                client, db = connect_to_mongodb(mongodb_string)
-                if client is not None and db is not None:
-                    st.session_state.mongodb_client = client
-                    st.session_state.mongodb_db = db
-                    st.session_state.mongodb_connected = True
-                    
-                    # Load attack patterns
-                    patterns = load_attack_patterns(db)
-                    st.session_state.attack_patterns = patterns
-                    
-                    st.success(f"✅ Connected! Loaded {len(patterns)} attack categories")
-                else:
-                    st.session_state.mongodb_connected = False
-        
-        if st.session_state.mongodb_connected:
-            st.success(f"🟢 MongoDB Connected")
-            st.info(f"📊 {len(st.session_state.attack_patterns)} attack patterns loaded")
-        else:
-            st.warning("🔴 MongoDB Not Connected")
+        st.image("https://img.icons8.com/color/96/000000/security-checked.png", width=100)
+        st.title("Navigation")
+        page = st.radio("Choose a page:", 
+                       ["📊 Train Model", "🔍 Analyze PCAP", "📈 Dashboard"])
         
         st.markdown("---")
-        
-        # API Key Input
-        st.subheader("🤖 Gemini AI Configuration")
-        api_key = st.text_input("Google Gemini API Key", type="password", value=st.session_state.api_key)
-        if api_key != st.session_state.api_key:
-            st.session_state.api_key = api_key
-            if api_key:
-                if configure_gemini(api_key):
-                    st.success("✅ API Key configured!")
-        
-        st.markdown("---")
-        
-        # Navigation
-        page = st.radio("Navigation", [
-            "🏠 Dashboard",
-            "🔍 URL Analysis", 
-            "📂 Bulk Analysis",
-            "🗂️ Attack Database",
-            "📊 Visualizations",
-            "⚙️ Pattern Management",
-            "📥 Export & Reports"
-        ])
-        
-        st.markdown("---")
-        
-        # Stats
-        if len(st.session_state.attacks_db) > 0:
-            st.metric("Total Attacks Detected", len(st.session_state.attacks_db))
-            critical_count = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
-            st.metric("Critical Threats", critical_count)
+        st.markdown("### About")
+        st.info("""
+        This system detects HTTP URL-based attacks including:
+        - SQL Injection
+        - XSS (Cross-Site Scripting)
+        - Directory Traversal
+        - Command Injection
+        - SSRF
+        - LFI/RFI
+        - XXE Injection
+        - And more...
+        """)
     
-    # Main Content
-    if not st.session_state.mongodb_connected:
-        st.warning("⚠️ Please connect to MongoDB to use the application")
-        st.info("Enter your MongoDB Atlas connection string in the sidebar and click 'Connect to MongoDB'")
-        return
+    # Initialize session state
+    if 'detector' not in st.session_state:
+        st.session_state.detector = HTTPAttackDetector()
+    if 'model_trained' not in st.session_state:
+        st.session_state.model_trained = False
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
     
-    if "Dashboard" in page:
-        show_dashboard()
-    elif "URL Analysis" in page:
-        show_url_analysis()
-    elif "Bulk Analysis" in page:
-        show_bulk_analysis()
-    elif "Attack Database" in page:
-        show_attack_database()
-    elif "Visualizations" in page:
-        show_visualizations()
-    elif "Pattern Management" in page:
-        show_pattern_management()
-    elif "Export" in page:
-        show_export()
+    # Page routing
+    if page == "📊 Train Model":
+        train_model_page()
+    elif page == "🔍 Analyze PCAP":
+        analyze_pcap_page()
+    elif page == "📈 Dashboard":
+        dashboard_page()
 
-def show_dashboard():
-    """Dashboard page"""
-    st.markdown('<p class="main-header">🛡️ Cyber Attack Detection System</p>', unsafe_allow_html=True)
-    st.markdown("### MongoDB-Powered AI Detection with Google Gemini")
-    
-    # Stats Cards
-    col1, col2, col3, col4 = st.columns(4)
-    
-    total_analyzed = len(st.session_state.analysis_history)
-    total_attacks = len(st.session_state.attacks_db)
-    
-    with col1:
-        st.metric("📊 Total Analyzed", total_analyzed)
-    
-    with col2:
-        st.metric("⚠️ Attacks Detected", total_attacks)
-    
-    with col3:
-        if total_analyzed > 0:
-            rate = (total_attacks / total_analyzed) * 100
-            st.metric("🎯 Detection Rate", f"{rate:.1f}%")
-        else:
-            st.metric("🎯 Detection Rate", "0%")
-    
-    with col4:
-        critical = len([a for a in st.session_state.attacks_db if a.get('severity') == 'CRITICAL'])
-        st.metric("🔴 Critical Threats", critical)
-    
-    st.markdown("---")
-    
-    # System Status
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🔧 System Status")
-        st.write(f"✅ MongoDB: Connected")
-        st.write(f"📊 Attack Patterns: {len(st.session_state.attack_patterns)}")
-        st.write(f"🤖 Gemini AI: {'Enabled' if st.session_state.api_key else 'Disabled'}")
-        
-        # Pattern categories
-        if len(st.session_state.attack_patterns) > 0:
-            st.write("**Loaded Categories:**")
-            for pattern_id, pattern_data in list(st.session_state.attack_patterns.items())[:5]:
-                st.write(f"  • {pattern_data['category']} ({pattern_data['severity']})")
-    
-    with col2:
-        st.subheader("📈 Attack Distribution")
-        if len(st.session_state.attacks_db) > 0:
-            attack_types = []
-            for attack in st.session_state.attacks_db:
-                attack_types.extend(attack.get('attack_types', []))
-            
-            if len(attack_types) > 0:
-                type_counts = Counter(attack_types)
-                df = pd.DataFrame(list(type_counts.items()), columns=['Attack Type', 'Count'])
-                fig = px.pie(df, values='Count', names='Attack Type', hole=0.4)
-                fig.update_layout(height=300)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No attacks detected yet")
-        else:
-            st.info("No attacks detected yet")
-    
-    # Recent Detections
-    st.subheader("🕐 Recent Detections")
-    if len(st.session_state.attacks_db) > 0:
-        recent = st.session_state.attacks_db[-10:][::-1]
-        
-        df = pd.DataFrame(recent)
-        if not df.empty:
-            display_df = pd.DataFrame({
-                'Timestamp': df['timestamp'],
-                'URL (Preview)': df['url'].str[:50] + '...',
-                'Attack Types': df['attack_types'].apply(lambda x: ', '.join(x[:3]) if isinstance(x, list) else x),
-                'Severity': df['severity'],
-                'Confidence': df['confidence'].apply(lambda x: f"{x}%")
-            })
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No detections yet. Start analyzing URLs!")
 
-def show_url_analysis():
-    """URL Analysis page"""
-    st.title("🔍 Single URL Analysis")
-    st.markdown("MongoDB-powered attack detection with comprehensive pattern matching")
+def train_model_page():
+    st.header("📊 Train Attack Detection Model")
     
-    # Input
-    url_input = st.text_area(
-        "URL or HTTP Request",
-        placeholder="http://example.com/page?id=1' OR '1'='1\n\nExample attacks:\n- SQL: /page?id=1' UNION SELECT * FROM users--\n- XSS: /search?q=<script>alert(1)</script>\n- Path Traversal: /file?path=../../etc/passwd",
-        height=150
-    )
+    st.markdown("""
+    Upload your training dataset (CSV format) to train the machine learning model.
+    The dataset should contain URL data and corresponding labels (benign/anomalous).
+    """)
     
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        analyze_button = st.button("🔍 Analyze", type="primary", use_container_width=True)
-    with col2:
-        use_gemini = st.checkbox("Use Gemini AI for deep analysis", value=True, disabled=not st.session_state.api_key)
-        if not st.session_state.api_key:
-            st.warning("⚠️ Configure Gemini API key for AI analysis")
+    uploaded_file = st.file_uploader("Upload Training Dataset (CSV)", type=['csv'])
     
-    if analyze_button and url_input:
-        with st.spinner("🔄 Analyzing URL with MongoDB patterns..."):
-            # Detect using MongoDB patterns
-            detected_attacks, all_matched_patterns = detect_attacks_from_mongodb(
-                url_input, 
-                st.session_state.attack_patterns
-            )
-            
-            # Calculate confidence and severity
-            confidence = calculate_confidence_score(detected_attacks, all_matched_patterns)
-            severity = determine_overall_severity(detected_attacks)
-            
-            # Gemini analysis
-            gemini_result = None
-            if use_gemini and st.session_state.api_key and detected_attacks:
-                with st.spinner("🤖 Running Gemini AI analysis..."):
-                    gemini_result = analyze_with_gemini(url_input, detected_attacks)
-            
-            # Combine results
-            if gemini_result:
-                confidence = gemini_result.get('confidence', confidence)
-                severity = gemini_result.get('severity', severity)
-                explanation = gemini_result.get('explanation', '')
-                attack_mechanism = gemini_result.get('attack_mechanism', '')
-                potential_impact = gemini_result.get('potential_impact', '')
-                recommendations = gemini_result.get('recommendations', [])
-            else:
-                explanation = "Pattern-based detection using MongoDB attack signatures"
-                attack_mechanism = ""
-                potential_impact = ""
-                recommendations = []
-            
-            is_malicious = len(detected_attacks) > 0
-            
-            # Prepare attack types list
-            attack_types = [data['category'] for data in detected_attacks.values()]
-            
-            # Store in history
-            analysis_record = {
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'url': url_input,
-                'attack_types': attack_types,
-                'confidence': confidence,
-                'severity': severity,
-                'is_malicious': is_malicious,
-                'detected_attacks': detected_attacks,
-                'matched_patterns_count': len(all_matched_patterns),
-                'explanation': explanation,
-                'recommendations': recommendations
-            }
-            
-            st.session_state.analysis_history.append(analysis_record)
-            
-            if is_malicious:
-                st.session_state.attacks_db.append(analysis_record)
-                
-                # Save to MongoDB
-                if st.session_state.mongodb_db is not None:
-                    save_detection_to_mongodb(st.session_state.mongodb_db, analysis_record)
-            
-            # Display Results
-            st.markdown("---")
-            st.subheader("📊 Analysis Results")
-            
-            if is_malicious:
-                st.markdown(f'<div class="attack-card">', unsafe_allow_html=True)
-                st.error("⚠️ **THREAT DETECTED!**")
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Confidence Score", f"{confidence}%")
-                with col2:
-                    severity_color = {
-                        'CRITICAL': '🔴',
-                        'HIGH': '🟠',
-                        'MEDIUM': '🟡',
-                        'LOW': '🟢'
-                    }.get(severity, '⚪')
-                    st.metric("Severity", f"{severity_color} {severity}")
-                with col3:
-                    st.metric("Attack Categories", len(detected_attacks))
-                with col4:
-                    st.metric("Patterns Matched", len(all_matched_patterns))
-                
-                # Detailed Attack Information
-                st.subheader("🎯 Detected Attack Types")
-                
-                for attack_id, attack_data in detected_attacks.items():
-                    with st.expander(f"🔴 {attack_data['category']} - {attack_data['severity']}", expanded=True):
-                        st.write(f"**Patterns Matched:** {attack_data['pattern_count']}")
-                        
-                        st.write("**Matched Indicators:**")
-                        for pattern in attack_data['matched_patterns'][:5]:  # Show first 5
-                            st.markdown(f'<div class="pattern-info">• {pattern["description"]}</div>', unsafe_allow_html=True)
-                            if pattern.get('example'):
-                                st.code(f"Example: {pattern['example']}", language="text")
-                        
-                        if attack_data.get('mitigation'):
-                            st.write("**Mitigation Strategies:**")
-                            for mitigation in attack_data['mitigation'][:3]:
-                                st.markdown(f"- {mitigation}")
-                
-                # AI Analysis
-                if gemini_result:
-                    st.subheader("🤖 AI-Powered Analysis")
-                    
-                    if explanation:
-                        st.info(f"**Analysis:** {explanation}")
-                    
-                    if attack_mechanism:
-                        st.warning(f"**Attack Mechanism:** {attack_mechanism}")
-                    
-                    if potential_impact:
-                        st.error(f"**Potential Impact:** {potential_impact}")
-                    
-                    if recommendations:
-                        st.write("**AI Recommendations:**")
-                        for rec in recommendations:
-                            st.markdown(f"- {rec}")
-                
-            else:
-                st.markdown(f'<div class="safe-card">', unsafe_allow_html=True)
-                st.success("✅ **NO THREATS DETECTED**")
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                st.info("The URL appears to be safe based on MongoDB pattern analysis.")
-
-def show_bulk_analysis():
-    """Bulk Analysis page"""
-    st.title("📂 Bulk Traffic Analysis")
-    st.markdown("Upload files for batch analysis using MongoDB patterns")
-    
-    if PCAP_SUPPORT or DPKT_SUPPORT:
-        pcap_libs = []
-        if PCAP_SUPPORT:
-            pcap_libs.append("Scapy")
-        if DPKT_SUPPORT:
-            pcap_libs.append("dpkt")
-        st.success(f"✅ PCAP support enabled ({', '.join(pcap_libs)})")
-    else:
-        st.warning("⚠️ PCAP support disabled. Install scapy or dpkt for PCAP analysis.")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a file",
-        type=['pcap', 'pcapng', 'csv', 'json', 'txt'],
-        help="Supported formats: PCAP, PCAPNG, CSV, JSON, TXT"
-    )
-    
-    with st.expander("⚙️ Analysis Options", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            use_ai = st.checkbox("Enable Gemini AI Analysis", value=False, disabled=not st.session_state.api_key)
-            save_to_db = st.checkbox("Save results to MongoDB", value=True)
-        with col2:
-            max_urls = st.number_input("Max URLs to analyze", min_value=10, max_value=1000, value=100)
-    
-    if uploaded_file is not None:
-        st.success(f"✅ File uploaded: {uploaded_file.name} ({uploaded_file.size / 1024:.2f} KB)")
+    if uploaded_file:
+        df = pd.read_csv(uploaded_file)
         
-        if st.button("🚀 Start Analysis", type="primary"):
-            with st.spinner("Processing file..."):
-                try:
-                    urls = []
-                    
-                    # Read file based on type
-                    if uploaded_file.name.endswith(('.pcap', '.pcapng')):
-                        if PCAP_SUPPORT or DPKT_SUPPORT:
-                            urls = parse_pcap_file(uploaded_file)
-                            if urls:
-                                st.info(f"📊 Extracted {len(urls)} URLs from PCAP")
-                        else:
-                            st.error("PCAP parsing requires scapy or dpkt.")
-                            return
-                    
-                    elif uploaded_file.name.endswith('.csv'):
-                        df = pd.read_csv(uploaded_file)
-                        st.info(f"📊 Loaded {len(df)} rows from CSV")
-                        
-                        if 'url' in df.columns:
-                            urls = df['url'].tolist()
-                        else:
-                            st.error("CSV must contain a 'url' column")
-                            return
-                    
-                    elif uploaded_file.name.endswith('.json'):
-                        data = json.load(uploaded_file)
-                        if isinstance(data, list):
-                            urls = [item.get('url', '') for item in data if isinstance(item, dict)]
-                        else:
-                            urls = [data.get('url', '')] if isinstance(data, dict) else []
-                        st.info(f"📊 Loaded {len(urls)} URLs from JSON")
-                    
-                    elif uploaded_file.name.endswith('.txt'):
-                        content = uploaded_file.read().decode('utf-8')
-                        urls = [line.strip() for line in content.split('\n') if line.strip()]
-                        st.info(f"📊 Loaded {len(urls)} URLs from text file")
-                    
-                    if not urls:
-                        st.warning("No URLs found in file")
-                        return
-                    
-                    # Remove duplicates and limit
-                    urls = list(set(urls))[:max_urls]
-                    st.info(f"🔍 Analyzing {len(urls)} unique URLs...")
-                    
-                    # Progress bar
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    results = []
-                    for idx, url in enumerate(urls):
-                        if url:
-                            status_text.text(f"Analyzing {idx + 1}/{len(urls)}: {url[:50]}...")
-                            
-                            # MongoDB pattern detection
-                            detected_attacks, all_matched_patterns = detect_attacks_from_mongodb(
-                                url, 
-                                st.session_state.attack_patterns
-                            )
-                            
-                            if detected_attacks:
-                                confidence = calculate_confidence_score(detected_attacks, all_matched_patterns)
-                                severity = determine_overall_severity(detected_attacks)
-                                attack_types = [data['category'] for data in detected_attacks.values()]
-                                
-                                # Optional Gemini analysis
-                                if use_ai and st.session_state.api_key:
-                                    gemini_result = analyze_with_gemini(url, detected_attacks)
-                                    if gemini_result:
-                                        confidence = gemini_result.get('confidence', confidence)
-                                        severity = gemini_result.get('severity', severity)
-                                
-                                result = {
-                                    'url': url,
-                                    'attack_types': attack_types,
-                                    'confidence': confidence,
-                                    'severity': severity,
-                                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    'pattern_matches': len(all_matched_patterns)
-                                }
-                                
-                                results.append(result)
-                                st.session_state.attacks_db.append(result)
-                                
-                                # Save to MongoDB
-                                if save_to_db and st.session_state.mongodb_db is not None:
-                                    save_detection_to_mongodb(st.session_state.mongodb_db, result)
-                        
-                        progress_bar.progress((idx + 1) / len(urls))
-                    
-                    status_text.text("✅ Analysis complete!")
-                    
-                    # Display results
-                    if results:
-                        st.success(f"🎯 Found {len(results)} potential attacks out of {len(urls)} URLs")
-                        
-                        # Summary statistics
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Total Threats", len(results))
-                        with col2:
-                            critical = len([r for r in results if r['severity'] == 'CRITICAL'])
-                            st.metric("Critical", critical)
-                        with col3:
-                            avg_conf = sum(r['confidence'] for r in results) / len(results)
-                            st.metric("Avg Confidence", f"{avg_conf:.1f}%")
-                        with col4:
-                            total_patterns = sum(r.get('pattern_matches', 0) for r in results)
-                            st.metric("Total Patterns", total_patterns)
-                        
-                        # Results table
-                        results_df = pd.DataFrame(results)
-                        results_df['attack_types'] = results_df['attack_types'].apply(lambda x: ', '.join(x[:2]) if isinstance(x, list) else x)
-                        
-                        display_df = results_df.copy()
-                        display_df['url'] = display_df['url'].str[:60] + '...'
-                        st.dataframe(display_df, use_container_width=True)
-                        
-                        # Download results
-                        csv = results_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Download Results (CSV)",
-                            data=csv,
-                            file_name=f"attack_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.success("✅ No attacks detected. All URLs appear safe!")
-                
-                except Exception as e:
-                    st.error(f"Error processing file: {str(e)}")
-                    import traceback
-                    st.code(traceback.format_exc())
-
-def show_attack_database():
-    """Attack Database page"""
-    st.title("🗂️ Attack Database")
-    st.markdown("Query and filter detected attacks")
-    
-    if len(st.session_state.attacks_db) == 0:
-        st.info("No attacks in database yet. Analyze some URLs to populate the database.")
-        return
-    
-    # Filters
-    with st.expander("🔍 Filters", expanded=True):
+        st.subheader("Dataset Preview")
+        st.dataframe(df.head(100), use_container_width=True)
+        
+        st.subheader("Dataset Information")
         col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Rows", len(df))
+        with col2:
+            st.metric("Total Columns", len(df.columns))
+        with col3:
+            st.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+        
+        # Column selection
+        st.subheader("Select Columns")
+        col1, col2 = st.columns(2)
         
         with col1:
-            all_attack_types = set()
-            for attack in st.session_state.attacks_db:
-                all_attack_types.update(attack.get('attack_types', []))
-            
-            selected_types = st.multiselect("Attack Type", sorted(list(all_attack_types)))
-        
+            url_column = st.selectbox("URL Column", df.columns)
         with col2:
-            selected_severity = st.multiselect("Severity", ["CRITICAL", "HIGH", "MEDIUM", "LOW"])
+            label_column = st.selectbox("Label Column", df.columns)
         
-        with col3:
-            min_confidence = st.slider("Minimum Confidence", 0, 100, 0)
-    
-    # Apply filters
-    filtered_attacks = st.session_state.attacks_db.copy()
-    
-    if selected_types:
-        filtered_attacks = [a for a in filtered_attacks if any(t in a.get('attack_types', []) for t in selected_types)]
-    
-    if selected_severity:
-        filtered_attacks = [a for a in filtered_attacks if a.get('severity') in selected_severity]
-    
-    if min_confidence > 0:
-        filtered_attacks = [a for a in filtered_attacks if a.get('confidence', 0) >= min_confidence]
-    
-    st.markdown(f"### 📊 Showing {len(filtered_attacks)} of {len(st.session_state.attacks_db)} attacks")
-    
-    # Display as dataframe
-    if len(filtered_attacks) > 0:
-        df = pd.DataFrame(filtered_attacks)
-        df['attack_types'] = df['attack_types'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x)
+        # Show label distribution
+        if label_column:
+            st.subheader("Label Distribution")
+            label_counts = df[label_column].value_counts()
+            fig = px.bar(x=label_counts.index, y=label_counts.values,
+                        labels={'x': 'Class', 'y': 'Count'},
+                        title="Class Distribution")
+            st.plotly_chart(fig, use_container_width=True)
         
-        display_columns = ['timestamp', 'url', 'attack_types', 'severity', 'confidence']
-        display_df = df[display_columns].copy()
-        display_df['url'] = display_df['url'].str[:60] + '...'
-        display_df['confidence'] = display_df['confidence'].apply(lambda x: f"{x}%")
-        
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        
-        # Export filtered results
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Export Filtered Results (CSV)",
-            data=csv,
-            file_name=f"filtered_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("No attacks match the selected filters.")
+        # Train button
+        if st.button("🚀 Train Model", type="primary"):
+            with st.spinner("Training model..."):
+                accuracy, X_test, y_test, y_pred = st.session_state.detector.train_model(
+                    df, url_column, label_column
+                )
+                st.session_state.model_trained = True
+                
+                st.success(f"✅ Model trained successfully! Accuracy: {accuracy:.2%}")
+                
+                # Show confusion matrix
+                st.subheader("Confusion Matrix")
+                cm = confusion_matrix(y_test, y_pred)
+                classes = st.session_state.detector.label_encoder.classes_
+                
+                fig = go.Figure(data=go.Heatmap(
+                    z=cm,
+                    x=classes,
+                    y=classes,
+                    colorscale='Blues',
+                    text=cm,
+                    texttemplate='%{text}',
+                    textfont={"size": 16}
+                ))
+                fig.update_layout(
+                    title="Confusion Matrix",
+                    xaxis_title="Predicted",
+                    yaxis_title="Actual"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Feature importance
+                st.subheader("Feature Importance")
+                feature_importance = pd.DataFrame({
+                    'feature': st.session_state.detector.feature_names,
+                    'importance': st.session_state.detector.model.feature_importances_
+                }).sort_values('importance', ascending=False)
+                
+                fig = px.bar(feature_importance.head(10), x='importance', y='feature',
+                           orientation='h', title="Top 10 Important Features")
+                st.plotly_chart(fig, use_container_width=True)
 
-def show_visualizations():
-    """Visualizations page"""
-    st.title("📊 Advanced Analytics & Visualizations")
+
+def analyze_pcap_page():
+    st.header("🔍 Analyze PCAP/PCAPNG Files")
     
-    if len(st.session_state.attacks_db) == 0:
-        st.info("No data available for visualization. Analyze some URLs first.")
+    if not st.session_state.model_trained:
+        st.warning("⚠️ Please train the model first in the 'Train Model' page.")
         return
     
-    df = pd.DataFrame(st.session_state.attacks_db)
+    st.markdown("""
+    Upload a PCAP or PCAPNG file to analyze HTTP traffic and detect potential attacks.
     
-    # Timeline
-    st.subheader("📈 Attack Timeline")
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    timeline_df = df.groupby(df['timestamp'].dt.date).size().reset_index(name='count')
-    timeline_df.columns = ['Date', 'Attacks']
+    **Requirements:** TShark must be installed on your system.
+    - Linux: `sudo apt-get install tshark`
+    - macOS: `brew install wireshark` (includes tshark)
+    - Windows: Install Wireshark (includes tshark)
+    """)
     
-    fig = px.line(timeline_df, x='Date', y='Attacks', markers=True)
-    fig.update_layout(height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    uploaded_pcap = st.file_uploader("Upload PCAP/PCAPNG File", 
+                                     type=['pcap', 'pcapng', 'cap'])
     
-    # Attack type distribution
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🎯 Attack Type Distribution")
-        attack_types = []
-        for attacks in df['attack_types']:
-            if isinstance(attacks, list):
-                attack_types.extend(attacks)
+    if uploaded_pcap:
+        with st.spinner("Parsing PCAP file..."):
+            df = parse_pcap_to_dataframe(uploaded_pcap)
         
-        if len(attack_types) > 0:
-            type_counts = Counter(attack_types)
-            type_df = pd.DataFrame(list(type_counts.items()), columns=['Attack Type', 'Count'])
-            type_df = type_df.sort_values('Count', ascending=False)
+        if df is not None and len(df) > 0:
+            st.success(f"✅ Successfully parsed {len(df)} HTTP requests")
             
-            fig = px.bar(type_df, x='Count', y='Attack Type', orientation='h',
-                         color='Count', color_continuous_scale='Reds')
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No attack type data available")
+            # Analyze traffic
+            with st.spinner("Analyzing traffic for attacks..."):
+                results = []
+                
+                for idx, row in df.iterrows():
+                    url = row.get('http.request.uri', '') or row.get('http.request.full_uri', '')
+                    
+                    if url:
+                        ml_prediction, confidence, pattern_detection = st.session_state.detector.predict(url)
+                        
+                        results.append({
+                            'packet_number': row.get('frame.number', idx),
+                            'timestamp': row.get('frame.time', ''),
+                            'src_ip': row.get('ip.src', ''),
+                            'dst_ip': row.get('ip.dst', ''),
+                            'method': row.get('http.request.method', ''),
+                            'url': url,
+                            'host': row.get('http.host', ''),
+                            'ml_prediction': ml_prediction,
+                            'confidence': confidence,
+                            'pattern_detection': pattern_detection,
+                            'final_verdict': pattern_detection if pattern_detection != 'benign' else ml_prediction
+                        })
+                
+                results_df = pd.DataFrame(results)
+                st.session_state.analysis_results = results_df
+            
+            # Display results
+            st.subheader("Analysis Results")
+            
+            # Metrics
+            col1, col2, col3, col4 = st.columns(4)
+            total_requests = len(results_df)
+            attacks_detected = len(results_df[results_df['final_verdict'] != 'benign'])
+            benign_requests = total_requests - attacks_detected
+            attack_rate = (attacks_detected / total_requests * 100) if total_requests > 0 else 0
+            
+            with col1:
+                st.metric("Total Requests", total_requests)
+            with col2:
+                st.metric("Attacks Detected", attacks_detected, delta=f"{attack_rate:.1f}%")
+            with col3:
+                st.metric("Benign Requests", benign_requests)
+            with col4:
+                avg_confidence = results_df['confidence'].mean()
+                st.metric("Avg Confidence", f"{avg_confidence:.2%}")
+            
+            # Attack distribution
+            if attacks_detected > 0:
+                st.subheader("Attack Type Distribution")
+                attack_types = results_df[results_df['final_verdict'] != 'benign']['final_verdict'].value_counts()
+                fig = px.pie(values=attack_types.values, names=attack_types.index,
+                           title="Detected Attack Types")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Detailed results
+            st.subheader("Detailed Results")
+            
+            # Filter options
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_type = st.multiselect("Filter by Attack Type",
+                                            options=results_df['final_verdict'].unique(),
+                                            default=results_df['final_verdict'].unique())
+            with col2:
+                min_confidence = st.slider("Minimum Confidence", 0.0, 1.0, 0.0)
+            
+            filtered_df = results_df[
+                (results_df['final_verdict'].isin(filter_type)) &
+                (results_df['confidence'] >= min_confidence)
+            ]
+            
+            # Highlight attacks
+            def highlight_attacks(row):
+                if row['final_verdict'] != 'benign':
+                    return ['background-color: #ffebee'] * len(row)
+                return [''] * len(row)
+            
+            styled_df = filtered_df.style.apply(highlight_attacks, axis=1)
+            st.dataframe(styled_df, use_container_width=True, height=400)
+            
+            # Export options
+            st.subheader("Export Results")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                csv = results_df.to_csv(index=False)
+                st.download_button("📥 Download CSV", csv, "attack_analysis.csv", "text/csv")
+            
+            with col2:
+                json_data = results_df.to_json(orient='records', indent=2)
+                st.download_button("📥 Download JSON", json_data, "attack_analysis.json", "application/json")
+
+
+def dashboard_page():
+    st.header("📈 Analysis Dashboard")
     
-    with col2:
-        st.subheader("⚠️ Severity Distribution")
-        severity_counts = df['severity'].value_counts()
+    if st.session_state.analysis_results is None:
+        st.info("No analysis results available. Please analyze a PCAP file first.")
+        return
+    
+    results_df = st.session_state.analysis_results
+    
+    # Time series analysis
+    if 'timestamp' in results_df.columns:
+        st.subheader("Attack Timeline")
         
-        if len(severity_counts) > 0:
-            colors = {'CRITICAL': '#FF4444', 'HIGH': '#FF8844', 'MEDIUM': '#FFBB44', 'LOW': '#44FF44'}
-            fig = go.Figure(data=[go.Pie(
-                labels=severity_counts.index,
-                values=severity_counts.values,
-                marker=dict(colors=[colors.get(s, '#CCCCCC') for s in severity_counts.index]),
-                hole=0.4
-            )])
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No severity data available")
+        # Parse timestamps
+        results_df['timestamp_parsed'] = pd.to_datetime(results_df['timestamp'], errors='coerce')
+        timeline_df = results_df.groupby([pd.Grouper(key='timestamp_parsed', freq='1min'), 'final_verdict']).size().reset_index(name='count')
+        
+        fig = px.line(timeline_df, x='timestamp_parsed', y='count', color='final_verdict',
+                     title="Attacks Over Time", labels={'timestamp_parsed': 'Time', 'count': 'Count'})
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Top attackers
+    st.subheader("Top Source IPs")
+    top_ips = results_df[results_df['final_verdict'] != 'benign']['src_ip'].value_counts().head(10)
+    fig = px.bar(x=top_ips.index, y=top_ips.values,
+                labels={'x': 'Source IP', 'y': 'Attack Count'},
+                title="Top 10 Attacking IPs")
+    st.plotly_chart(fig, use_container_width=True)
     
     # Confidence distribution
-    st.subheader("📊 Confidence Score Distribution")
-    fig = px.histogram(df, x='confidence', nbins=20, 
-                       labels={'confidence': 'Confidence Score', 'count': 'Number of Attacks'})
-    fig.update_layout(height=350)
+    st.subheader("Prediction Confidence Distribution")
+    fig = px.histogram(results_df, x='confidence', nbins=20,
+                      title="Distribution of Prediction Confidence")
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Sample attacks
+    st.subheader("Sample Detected Attacks")
+    attacks = results_df[results_df['final_verdict'] != 'benign'].head(10)
+    for idx, row in attacks.iterrows():
+        with st.expander(f"🚨 {row['final_verdict'].upper()} - Packet #{row['packet_number']}"):
+            st.markdown(f"**Source IP:** {row['src_ip']}")
+            st.markdown(f"**Method:** {row['method']}")
+            st.markdown(f"**Host:** {row['host']}")
+            st.markdown(f"**Confidence:** {row['confidence']:.2%}")
+            st.code(row['url'], language='text')
 
-def show_pattern_management():
-    """Pattern Management page"""
-    st.title("⚙️ Attack Pattern Management")
-    st.markdown("View and manage MongoDB attack patterns")
-    
-    if len(st.session_state.attack_patterns) == 0:
-        st.warning("No attack patterns loaded from MongoDB")
-        if st.button("🔄 Try Loading Patterns"):
-            if st.session_state.mongodb_db is not None:
-                patterns = load_attack_patterns(st.session_state.mongodb_db)
-                st.session_state.attack_patterns = patterns
-                if len(patterns) > 0:
-                    st.success(f"✅ Loaded {len(patterns)} attack categories")
-                    st.rerun()
-                else:
-                    st.error("No patterns found in MongoDB")
-            else:
-                st.error("MongoDB not connected")
-        return
-    
-    # Statistics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    total_patterns = sum(len(p['patterns']) for p in st.session_state.attack_patterns.values())
-    critical_cats = len([p for p in st.session_state.attack_patterns.values() if p['severity'] == 'CRITICAL'])
-    high_cats = len([p for p in st.session_state.attack_patterns.values() if p['severity'] == 'HIGH'])
-    
-    with col1:
-        st.metric("Total Categories", len(st.session_state.attack_patterns))
-    with col2:
-        st.metric("Total Patterns", total_patterns)
-    with col3:
-        st.metric("Critical Categories", critical_cats)
-    with col4:
-        st.metric("High Categories", high_cats)
-    
-    st.markdown("---")
-    
-    # Pattern browser
-    st.subheader("📋 Pattern Categories")
-    
-    for attack_id, pattern_data in st.session_state.attack_patterns.items():
-        with st.expander(f"{pattern_data['category']} - {pattern_data['severity']} ({len(pattern_data['patterns'])} patterns)"):
-            st.write(f"**Description:** {pattern_data['description']}")
-            st.write(f"**Severity:** {pattern_data['severity']}")
-            st.write(f"**Pattern Count:** {len(pattern_data['patterns'])}")
-            
-            st.write("**Sample Patterns:**")
-            for i, pattern in enumerate(pattern_data['patterns'][:5]):
-                st.markdown(f"**{i+1}. {pattern['description']}**")
-                st.code(f"Regex: {pattern['regex'][:100]}...", language="regex")
-                if pattern.get('example'):
-                    st.code(f"Example: {pattern['example']}", language="text")
-                st.markdown("---")
-            
-            if pattern_data.get('mitigation'):
-                st.write("**Mitigation Strategies:**")
-                for mitigation in pattern_data['mitigation'][:5]:
-                    st.markdown(f"- {mitigation}")
-    
-    # Refresh patterns button
-    st.markdown("---")
-    if st.button("🔄 Refresh Patterns from MongoDB", type="primary"):
-        with st.spinner("Reloading patterns..."):
-            patterns = load_attack_patterns(st.session_state.mongodb_db)
-            st.session_state.attack_patterns = patterns
-            st.success(f"✅ Reloaded {len(patterns)} attack categories")
-            st.rerun()
-
-def show_export():
-    """Export & Reports page"""
-    st.title("📥 Export & Report Generation")
-    
-    if len(st.session_state.attacks_db) == 0:
-        st.info("No data available for export. Analyze some URLs first.")
-        return
-    
-    st.markdown("### Export Options")
-    
-    # Export format selection
-    export_format = st.radio(
-        "Select Export Format",
-        ["CSV", "JSON", "PDF Report (Summary)", "Excel"],
-        horizontal=True
-    )
-    
-    # Data selection
-    st.markdown("### Data Selection")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        include_url = st.checkbox("Include full URLs", value=True)
-        include_patterns = st.checkbox("Include pattern matches", value=True)
-    
-    with col2:
-        include_timestamp = st.checkbox("Include timestamps", value=True)
-        include_confidence = st.checkbox("Include confidence scores", value=True)
-    
-    # Date range filter
-    st.markdown("### Filter by Date Range")
-    df = pd.DataFrame(st.session_state.attacks_db)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    min_date = df['timestamp'].min().date()
-    max_date = df['timestamp'].max().date()
-    
-    date_range = st.date_input(
-        "Select date range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    if len(date_range) == 2:
-        start_date, end_date = date_range
-        filtered_df = df[(df['timestamp'].dt.date >= start_date) & (df['timestamp'].dt.date <= end_date)]
-    else:
-        filtered_df = df
-    
-    st.info(f"📊 {len(filtered_df)} attacks in selected date range")
-    
-    # Generate export
-    if st.button("🚀 Generate Export", type="primary"):
-        with st.spinner("Generating export..."):
-            export_data = filtered_df.copy()
-            
-            if export_format == "CSV":
-                csv = export_data.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name=f"cyber_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-                st.success("✅ CSV export ready!")
-            
-            elif export_format == "JSON":
-                json_data = export_data.to_json(orient='records', date_format='iso')
-                st.download_button(
-                    label="📥 Download JSON",
-                    data=json_data,
-                    file_name=f"cyber_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json"
-                )
-                st.success("✅ JSON export ready!")
-            
-            elif export_format == "PDF Report (Summary)":
-                report = generate_summary_report(filtered_df)
-                st.download_button(
-                    label="📥 Download Report",
-                    data=report,
-                    file_name=f"security_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    mime="text/plain"
-                )
-                st.success("✅ Report generated!")
-            
-            elif export_format == "Excel":
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    export_data.to_excel(writer, sheet_name='Attacks', index=False)
-                
-                st.download_button(
-                    label="📥 Download Excel",
-                    data=output.getvalue(),
-                    file_name=f"cyber_attacks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.success("✅ Excel export ready!")
-    
-    # MongoDB Statistics
-    st.markdown("---")
-    st.markdown("### 📊 MongoDB Statistics")
-    
-    if st.button("📈 Load Statistics from MongoDB"):
-        try:
-            stats_collection = st.session_state.mongodb_db['attack_statistics']
-            stats = stats_collection.find_one({'stat_id': 'initial'})
-            
-            if stats:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.metric("Total Detections", stats.get('total_detections', 0))
-                    st.write("**Detections by Severity:**")
-                    for severity, count in stats.get('detections_by_severity', {}).items():
-                        st.write(f"  • {severity}: {count}")
-                
-                with col2:
-                    st.write("**Top Attack Categories:**")
-                    categories = stats.get('detections_by_category', {})
-                    sorted_cats = sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]
-                    for cat, count in sorted_cats:
-                        st.write(f"  • {cat}: {count}")
-            else:
-                st.info("No statistics available in MongoDB")
-        
-        except Exception as e:
-            st.error(f"Error loading statistics: {str(e)}")
-
-def generate_summary_report(df):
-    """Generate a text-based summary report"""
-    report = f"""
-CYBER ATTACK DETECTION SYSTEM
-MongoDB-Powered Security Analysis Report
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-{'='*60}
-EXECUTIVE SUMMARY
-{'='*60}
-
-Total Attacks Detected: {len(df)}
-Date Range: {df['timestamp'].min()} to {df['timestamp'].max()}
-
-Severity Breakdown:
-{df['severity'].value_counts().to_string()}
-
-Top Attack Types:
-"""
-    
-    attack_types = []
-    for attacks in df['attack_types']:
-        if isinstance(attacks, list):
-            attack_types.extend(attacks)
-    
-    type_counts = Counter(attack_types)
-    for attack_type, count in type_counts.most_common(5):
-        report += f"\n  - {attack_type}: {count}"
-    
-    report += f"""
-
-Average Confidence Score: {df['confidence'].mean():.1f}%
-
-{'='*60}
-RECOMMENDATIONS
-{'='*60}
-
-1. Review and block IPs associated with critical threats
-2. Update WAF rules based on detected attack patterns
-3. Conduct security awareness training
-4. Implement rate limiting for suspicious endpoints
-5. Enable detailed logging for forensic analysis
-
-{'='*60}
-MongoDB Attack Patterns Used
-Total Pattern Categories: {len(st.session_state.attack_patterns)}
-Total Detection Patterns: {sum(len(p['patterns']) for p in st.session_state.attack_patterns.values())}
-
-End of Report
-"""
-    
-    return report
 
 if __name__ == "__main__":
     main()
