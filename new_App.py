@@ -426,7 +426,7 @@ def train_model_page():
             with col2:
                 st.metric("Total Columns", len(df.columns))
             with col3:
-                st.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+                st.metric("Memory Usage", f"{df.memory_usage(deep=True).sum() / 10000024**2:.2f} MB")
             
             # Column selection
             st.subheader("Select Columns")
