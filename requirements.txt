@@ -24,3 +24,16 @@ openpyxl>=3.1.2
 # Additional utilities
 python-dateutil>=2.8.2
 pytz>=2023.3
+
+# Visualization
+plotly>=5.18.0
+
+# PCAP/Network Analysis
+scapy>=2.5.0
+
+# File Processing
+openpyxl>=3.1.2
+
+# Additional utilities
+python-dateutil>=2.8.2
+pytz>=2023.3
